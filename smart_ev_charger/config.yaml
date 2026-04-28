@@ -3,7 +3,7 @@ description: "Intelligente PV-basierte EV-Ladesteuerung mit Lernfunktion, Progno
 version: "2.0.0"
 slug: "smart_ev_charger"
 init: false
-url: "https://github.com/DEIN_GITHUB_USER/smart-ev-charger-addon"
+url: "https://github.com/Mod1819/smart-ev-charger-addon"
 
 arch:
   - aarch64

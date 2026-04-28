@@ -19,7 +19,7 @@ Intelligente PV-basierte Ladesteuerung für Elektroautos. Das Add-on berechnet t
 ## Installation als Custom Repository in HACS
 
 1. HACS öffnen → **Einstellungen** → **Benutzerdefinierte Repositories**
-2. URL eintragen: `https://github.com/DEIN_GITHUB_USER/smart-ev-charger-addon`
+2. URL eintragen: `https://github.com/Mod1819/smart-ev-charger-addon`
 3. Kategorie: **Add-on**
 4. Hinzufügen → Add-on erscheint in der HACS Add-on-Liste
 5. Installieren und in Home Assistant aktivieren
@@ -29,7 +29,7 @@ Intelligente PV-basierte Ladesteuerung für Elektroautos. Das Add-on berechnet t
 ```bash
 # In der HA-Shell oder per SSH:
 cd /mnt/data/supervisor/addons/local/
-git clone https://github.com/DEIN_GITHUB_USER/smart-ev-charger-addon smart_ev_charger
+git clone https://github.com/Mod1819/smart-ev-charger-addon smart_ev_charger
 ha addons rebuild local_smart_ev_charger
 ```
 
