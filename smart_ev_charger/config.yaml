@@ -1,0 +1,52 @@
+name: "Smart EV Charger"
+description: "Intelligente PV-basierte EV-Ladesteuerung mit Lernfunktion, Prognose-Integration und Budget-Management"
+version: "2.0.0"
+slug: "smart_ev_charger"
+init: false
+url: "https://github.com/DEIN_GITHUB_USER/smart-ev-charger-addon"
+
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+
+startup: application
+boot: auto
+
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:car-electric
+panel_title: "Smart EV Charger"
+
+homeassistant_api: true
+
+options:
+  evcc_url: "http://192.168.x.x:7070"
+  ha_url: ""
+  ha_token: ""
+  batterie_kapazitaet_kwh: 9.0
+  batterie_min_soc: 15
+  haus_ema_kwh: 11.0
+  update_interval_min: 5
+  loadpoint_id: 1
+  sensor_pv_prognose: ""
+  sensor_pv_heute: ""
+  sensor_batterie_soc: ""
+  sensor_pv_leistung: ""
+  sensor_haus_last: ""
+
+schema:
+  evcc_url: str
+  ha_url: str
+  ha_token: str
+  batterie_kapazitaet_kwh: float
+  batterie_min_soc: int
+  haus_ema_kwh: float
+  update_interval_min: int
+  loadpoint_id: int
+  sensor_pv_prognose: str
+  sensor_pv_heute: str
+  sensor_batterie_soc: str
+  sensor_pv_leistung: str
+  sensor_haus_last: str

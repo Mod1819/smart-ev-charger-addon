@@ -1,0 +1,5 @@
+flask==3.0.3
+requests==2.31.0
+pymodbus==3.6.9
+gunicorn==21.2.0
+holidays==0.46
