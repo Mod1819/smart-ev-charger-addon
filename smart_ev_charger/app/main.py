@@ -251,7 +251,8 @@ user_settings = load_settings()
 # ---------------------------------------------------------------------------
 
 _debug_buffer: deque = deque(maxlen=DEBUG_BUFFER_MAX)
-_debug_prev: dict = {}  # letzte bekannte Werte für Delta-Erkennung
+_debug_prev: dict = {}   # letzte bekannte Werte für Delta-Erkennung
+_last_loop_sig: str = "" # Signatur des letzten Loop-Durchlaufs (Duplikat-Filter)
 
 def dlog(msg: str, category: str = "info"):
     """Schreibt in den Debug-Ringpuffer wenn debug_mode aktiv."""
@@ -1228,8 +1229,17 @@ def control_loop():
     batt_soc    = ha_sensor(get_sensor("batterie_soc"), required=True) if has_battery() else 100
     pv_leistung = pv_leistung_pre  # bereits oben gelesen
 
+    # Loop-Signatur — Routine-Logs nur bei echten Änderungen
+    global _last_loop_sig
+    _loop_sig = (
+        f"{round(remaining_pv_forecast,1)}|{round(pv_prognose_total,1)}|"
+        f"{round(batt_soc)}|{round(pv_leistung,-2)}"
+    )
+    _loop_sig_changed = _loop_sig != _last_loop_sig
+
     dlog(f"── Loop Start ──────────────────────────────────────")
-    dlog(f"Sensoren: PV-Forecast-Rest={remaining_pv_forecast:.2f} kWh | PV-Heute-Total={pv_prognose_total:.2f} kWh | PV-Real={pv_heute_raw:.3f} kWh | Batt-SOC={batt_soc:.1f}% | PV-Leistung={pv_leistung:.0f} W")
+    if _loop_sig_changed:
+        dlog(f"Sensoren: PV-Forecast-Rest={remaining_pv_forecast:.2f} kWh | PV-Heute-Total={pv_prognose_total:.2f} kWh | PV-Real={pv_heute_raw:.3f} kWh | Batt-SOC={batt_soc:.1f}% | PV-Leistung={pv_leistung:.0f} W")
     dlog_delta("remaining_pv_forecast", "Forecast-Rest", remaining_pv_forecast, " kWh", threshold=0.1)
     dlog_delta("pv_prognose_total",     "Forecast-Gesamt", pv_prognose_total,   " kWh", threshold=0.2)
     dlog_delta("batt_soc",              "Batterie-SOC",    batt_soc,            "%",    threshold=1.0)
@@ -1342,7 +1352,12 @@ def control_loop():
     ueberschuss_fallback  = (initial_daily_budget is None) and einspeisung_w > 500 and hat_pv_rest
     budget_ok             = (budget_verfuegbar_echt > 0 or ueberschuss_fallback) and hat_pv_rest
 
-    dlog(f"[M2] Gate: budget_verfuegbar={budget_verfuegbar:.2f} | puffer={budget_puffer:.2f} | echt={budget_verfuegbar_echt:.2f} | budget_ok={budget_ok}", "decision")
+    # M2-Signatur erweitern
+    _loop_sig += f"|{round(budget_verfuegbar,1)}|{budget_ok}"
+    _loop_sig_changed = _loop_sig != _last_loop_sig
+
+    if _loop_sig_changed:
+        dlog(f"[M2] Gate: budget_verfuegbar={budget_verfuegbar:.2f} | puffer={budget_puffer:.2f} | echt={budget_verfuegbar_echt:.2f} | budget_ok={budget_ok}", "decision")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # MODUL 3 — COUNTDOWN "WENN JETZT ANSCHLIESSEN"
@@ -1367,7 +1382,12 @@ def control_loop():
     countdown_roh = max(remaining_safe * pv_faktor - haus_rest_live - batt_rest_live, 0)
     countdown_kwh = round(min(countdown_roh, budget_verfuegbar_echt), 2)
 
-    dlog(f"[M3] Countdown: {remaining_safe:.2f}×{pv_faktor:.3f} − haus_rest={haus_rest_live:.2f} − batt={batt_rest_live:.2f} = {countdown_roh:.2f} → gedeckelt {countdown_kwh:.2f} kWh", "info")
+    # M3-Signatur finalisieren
+    _loop_sig += f"|{round(countdown_kwh,1)}"
+    _loop_sig_changed = _loop_sig != _last_loop_sig
+
+    if _loop_sig_changed:
+        dlog(f"[M3] Countdown: {remaining_safe:.2f}×{pv_faktor:.3f} − haus_rest={haus_rest_live:.2f} − batt={batt_rest_live:.2f} = {countdown_roh:.2f} → gedeckelt {countdown_kwh:.2f} kWh", "info")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # MODUL 5 — BUDGET-SCHNELL
@@ -1471,8 +1491,8 @@ def control_loop():
             evcc_set_mode("off")
 
     else:
-        action      = "laden"
         if laden_schnell:
+            action      = "laden"
             # Modul 5: Schnell-Laden → now-Modus, maxcurrent regelt Schnell-Regler-Thread
             target_mode = "now"
             cur_max_a   = int(lp.get("maxCurrent") or 16)
@@ -1491,6 +1511,8 @@ def control_loop():
                 evcc_set_mincurrent(target_a)
             if current_mode != target_mode:
                 evcc_set_mode(target_mode)
+            # Lädt gerade wirklich? Sonst "bereit" anzeigen (Auto voll oder warte auf PV)
+            action = "laden" if car_charging else "bereit"
 
     _batt_charge_raw = ha_sensor(user_settings.get("growatt_battery_charge_power", "sensor.growatt_battery_charge_power")) or 0
     # Sensor liefert Watt → in kW umrechnen
@@ -1621,7 +1643,9 @@ def control_loop():
         dlog(f"ACTION WECHSEL: {state.get('_last_logged_action','–')} → {action} | Grund: {grund}", "action")
         db_log_control()
         state["_last_logged_action"] = action
-    dlog(f"── Loop Ende ── Action: {action} | Countdown: {countdown_kwh:.2f} kWh | Deadline: {ansteck_deadline or '–'} ({ansteck_urgency or 'n/a'})")
+    if _loop_sig_changed:
+        dlog(f"── Loop Ende ── Action: {action} | Countdown: {countdown_kwh:.2f} kWh | Deadline: {ansteck_deadline or '–'} ({ansteck_urgency or 'n/a'})")
+        _last_loop_sig = _loop_sig
     db_update_today(charged_today, einspeisung_heute)
     check_and_send_notifications(action, budget_verfuegbar_echt, ansteck_urgency, car_connected, charged_today)
 
@@ -2704,7 +2728,6 @@ TEMPLATE = r"""<!DOCTYPE html>
 
       <!-- Wallbox-Typ Auswahl -->
       <div style="margin-bottom:0.85rem; padding-bottom:0.75rem; border-bottom:1px solid var(--border);">
-        <label class="cfg-label" data-i18n="cfg_wallbox_type">Wallbox-Steuerung</label>
         <select id="cfg-wallbox-type" class="cfg-input" onchange="onWallboxTypeChange()">
           <option value="evcc" data-i18n="cfg_wallbox_type_evcc">evcc (empfohlen)</option>
           <option value="ha_direct" data-i18n="cfg_wallbox_type_ha">Direkt über Home Assistant</option>
@@ -3110,7 +3133,8 @@ const TRANSLATIONS = {
     hero_stat_pv_now:"PV jetzt", hero_stat_charged_today:"Geladen heute",
     hero_day_complete:"Tag abgeschlossen", hero_no_budget:"Kein Budget",
     badge_car_disconnected:"Nicht verbunden", badge_charging:"Lädt", badge_connected:"Verbunden",
-    action_laden:"Laden", action_idle:"Bereit", action_kein_budget:"Kein Budget",
+    action_laden:"Laden", action_idle:"Bereit", action_bereit:"Warte auf PV / Auto voll",
+    action_kein_budget:"Kein Budget",
     action_pausiert:"Pausiert", action_batterie_schutz:"Batterieschutz", action_start:"Start", action_schlaf:"Schlaf",
     morgen_prognose:"Morgen Prognose:",
     infobox_connect_until:"🔌 Auto anschließen bis",
@@ -3231,7 +3255,8 @@ const TRANSLATIONS = {
     hero_stat_pv_now:"PV now", hero_stat_charged_today:"Charged today",
     hero_day_complete:"Day complete", hero_no_budget:"No budget",
     badge_car_disconnected:"Not connected", badge_charging:"Charging", badge_connected:"Connected",
-    action_laden:"Charging", action_idle:"Ready", action_kein_budget:"No Budget",
+    action_laden:"Charging", action_idle:"Ready", action_bereit:"Waiting for PV / Car full",
+    action_kein_budget:"No Budget",
     action_pausiert:"Paused", action_batterie_schutz:"Battery Protection", action_start:"Start", action_schlaf:"Sleep",
     morgen_prognose:"Tomorrow forecast:",
     infobox_connect_until:"🔌 Connect car by",
@@ -3406,6 +3431,7 @@ function getActionLabels() {
   return {
     laden:           t("action_laden"),
     idle:            t("action_idle"),
+    bereit:          t("action_bereit"),
     kein_budget:     t("action_kein_budget"),
     pausiert:        t("action_pausiert"),
     batterie_schutz: t("action_batterie_schutz"),
@@ -3414,12 +3440,13 @@ function getActionLabels() {
 }
 
 const ACTION_LABELS = {
-  laden:"Laden", idle:"Bereit", kein_budget:"Kein Budget",
-  pausiert:"Pausiert", batterie_schutz:"Batterieschutz", start:"Start", schlaf:"Schlaf"
+  laden:"Laden", idle:"Bereit", bereit:"Warte auf PV / Auto voll",
+  kein_budget:"Kein Budget", pausiert:"Pausiert",
+  batterie_schutz:"Batterieschutz", start:"Start", schlaf:"Schlaf"
 };
 
 const ACTION_ICONS = {
-  laden:"⚡", idle:"⏸", kein_budget:"☁", pausiert:"⏸",
+  laden:"⚡", idle:"⏸", bereit:"🔋", kein_budget:"☁", pausiert:"⏸",
   batterie_schutz:"🔋", start:"⏳", schlaf:"😴"
 };
 
