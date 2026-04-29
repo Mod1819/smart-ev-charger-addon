@@ -1,6 +1,6 @@
 name: "Smart EV Charger"
 description: "Intelligente PV-basierte EV-Ladesteuerung mit Lernfunktion, Prognose-Integration und Budget-Management"
-version: "2.0.0"
+version: "2.1.0"
 slug: "smart_ev_charger"
 init: false
 url: "https://github.com/Mod1819/smart-ev-charger-addon"
