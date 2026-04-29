@@ -140,6 +140,9 @@ def load_settings():
     data.setdefault("addon_aktiv", True)
     data.setdefault("min_strom_a", 6)
     data.setdefault("haus_verbrauch_kwh", 10.0)  # Startwert für EMA (vom Nutzer einzustellen)
+    data.setdefault("sensor_auto_soc",   "")     # optional: Fahrzeug-SOC Sensor
+    data.setdefault("auto_batterie_kwh", 0.0)    # optional: Fahrzeug-Batteriegröße (kWh)
+    data.setdefault("auto_ziel_soc",     80)     # Ziel-SOC Fahrzeug (%)
     if "haus_ema_wochentag" not in data:
         base = float(data.get("haus_verbrauch_kwh", 10.0))
         data["haus_ema_wochentag"] = {str(i): base for i in range(7)}
@@ -1267,6 +1270,19 @@ def control_loop():
 
     charged_today = evcc_charged_today(lp=lp)
 
+    # --- Fahrzeug-SOC (optional, aus HA-Sensor) ---
+    _auto_soc_entity = user_settings.get("sensor_auto_soc", "").strip()
+    _auto_batt_kwh   = float(user_settings.get("auto_batterie_kwh", 0.0) or 0.0)
+    _auto_ziel_soc   = int(user_settings.get("auto_ziel_soc", 80) or 80)
+    auto_soc: float | None = None
+    if _auto_soc_entity:
+        _raw = ha_sensor(_auto_soc_entity)
+        if _raw is not None:
+            try: auto_soc = float(_raw)
+            except (ValueError, TypeError): auto_soc = None
+    # Auto voll wenn Ziel-SOC erreicht
+    auto_voll = (auto_soc is not None) and (auto_soc >= _auto_ziel_soc)
+
     # --- Einstellungen (live aus user_settings) ---
     batt_kap  = get_batt_kap()
     ziel_soc  = get_batt_ziel_soc()
@@ -1476,6 +1492,12 @@ def control_loop():
         if current_mode != "off":
             evcc_set_mode("off")
 
+    elif auto_voll:
+        action = "auto_voll"
+        grund  = f"Fahrzeug-SOC {auto_soc:.0f}% ≥ Ziel {_auto_ziel_soc}%"
+        if current_mode != "off":
+            evcc_set_mode("off")
+
     elif not batt_ok:
         action = "batterie_schutz"
         grund  = f"Speicher-SOC {batt_soc:.0f}% < Notfall-Minimum {get_batt_min_soc()}%"
@@ -1607,6 +1629,10 @@ def control_loop():
         "action":                   action,
         "grund":                    grund,
         "car_connected":            car_connected,
+        "auto_soc":                 auto_soc,
+        "auto_ziel_soc":            _auto_ziel_soc,
+        "auto_batt_kwh":            _auto_batt_kwh,
+        "auto_voll":                auto_voll,
         "evcc_online":              state.get("evcc_online", True),
         "evcc_mode":                lp.get("mode", "?"),
         "ziel_strom_a":             target_a,
@@ -2499,6 +2525,10 @@ TEMPLATE = r"""<!DOCTYPE html>
       <span class="hero-stat-label" data-i18n="hero_stat_battery_soc">Batterie SOC</span>
       <span class="hero-stat-val" id="batt-soc">–</span>
     </div>
+    <div class="hero-stat" id="auto-soc-tile" style="display:none;">
+      <span class="hero-stat-label" data-i18n="hero_stat_auto_soc">Auto SOC</span>
+      <span class="hero-stat-val" id="auto-soc-val">–</span>
+    </div>
     <div class="hero-stat">
       <span class="hero-stat-label" data-i18n="hero_stat_pv_now">PV jetzt</span>
       <span class="hero-stat-val" id="pv-leistung">–</span>
@@ -2790,6 +2820,34 @@ TEMPLATE = r"""<!DOCTYPE html>
             <input type="text" id="cfg-wb-current" class="cfg-input" placeholder="number.wallbox_charge_current">
             <button class="cfg-test-btn" onclick="openEntitySearch('cfg-wb-current')">🔍</button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Fahrzeug (optional) -->
+    <div class="card">
+      <div class="card-title" data-i18n="card_vehicle">🚗 Fahrzeug (optional)</div>
+      <div style="font-size:0.75rem; color:var(--muted); margin-bottom:0.85rem;" data-i18n="card_vehicle_hint">Wenn dein Fahrzeug den SOC an HA meldet, kann das Add-on präziser steuern und automatisch stoppen wenn das Ziel erreicht ist.</div>
+      <div style="margin-bottom:0.65rem;">
+        <label class="cfg-label" data-i18n="cfg_auto_soc_sensor">Fahrzeug-SOC Sensor</label>
+        <div style="display:flex; gap:0.5rem;">
+          <input type="text" id="cfg-auto-soc" class="cfg-input" placeholder="sensor.mein_auto_soc">
+          <button class="cfg-test-btn" onclick="openEntitySearch('cfg-auto-soc')">🔍</button>
+        </div>
+      </div>
+      <div style="margin-bottom:0.65rem;">
+        <label class="cfg-label" data-i18n="cfg_auto_batterie_kwh">Fahrzeug-Batteriegröße (kWh)</label>
+        <input type="number" id="cfg-auto-batt-kwh" class="cfg-input" min="0" max="200" step="0.5" placeholder="0 = nicht genutzt">
+      </div>
+      <div>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.35rem;">
+          <label class="cfg-label" style="margin:0" data-i18n="cfg_auto_ziel_soc">Ziel-SOC Fahrzeug</label>
+          <span id="cfg-auto-ziel-soc-val" style="font-family:'JetBrains Mono',monospace; color:var(--accent); font-weight:700;">80%</span>
+        </div>
+        <input type="range" id="cfg-auto-ziel-soc" min="20" max="100" step="5"
+          oninput="document.getElementById('cfg-auto-ziel-soc-val').textContent=this.value+'%'">
+        <div style="display:flex; justify-content:space-between; font-size:0.72rem; color:var(--muted);">
+          <span>20%</span><span>100%</span>
         </div>
       </div>
     </div>
@@ -3140,7 +3198,7 @@ const TRANSLATIONS = {
     hero_day_complete:"Tag abgeschlossen", hero_no_budget:"Kein Budget",
     badge_car_disconnected:"Nicht verbunden", badge_charging:"Lädt", badge_connected:"Verbunden",
     action_laden:"Laden", action_idle:"Bereit", action_bereit:"Warte auf PV / Auto voll",
-    action_kein_budget:"Kein Budget",
+    action_auto_voll:"Auto voll", action_kein_budget:"Kein Budget",
     action_pausiert:"Pausiert", action_batterie_schutz:"Batterieschutz", action_start:"Start", action_schlaf:"Schlaf",
     morgen_prognose:"Morgen Prognose:",
     infobox_connect_until:"🔌 Auto anschließen bis",
@@ -3180,6 +3238,13 @@ const TRANSLATIONS = {
     today_label:"heute",
     cfg_haus_verbrauch:"Ø Tagesverbrauch Haus (kWh)",
     cfg_haus_verbrauch_hint:"Startwert für die Lernfunktion. Bei Änderung wird die EMA für alle Wochentage zurückgesetzt.",
+    card_vehicle:"🚗 Fahrzeug (optional)",
+    card_vehicle_hint:"Wenn dein Fahrzeug den SOC an HA meldet, kann das Add-on präziser steuern und automatisch stoppen wenn das Ziel erreicht ist.",
+    cfg_auto_soc_sensor:"Fahrzeug-SOC Sensor",
+    cfg_auto_batterie_kwh:"Fahrzeug-Batteriegröße (kWh)",
+    cfg_auto_ziel_soc:"Ziel-SOC Fahrzeug",
+    hero_stat_auto_soc:"Auto SOC",
+    action_auto_voll:"Auto voll",
     card_evcc_connection:"Wallbox Verbindung",
     cfg_wallbox_type:"Wallbox-Steuerung",
     cfg_wallbox_type_evcc:"evcc (empfohlen)",
@@ -3264,7 +3329,7 @@ const TRANSLATIONS = {
     hero_day_complete:"Day complete", hero_no_budget:"No budget",
     badge_car_disconnected:"Not connected", badge_charging:"Charging", badge_connected:"Connected",
     action_laden:"Charging", action_idle:"Ready", action_bereit:"Waiting for PV / Car full",
-    action_kein_budget:"No Budget",
+    action_auto_voll:"Car full", action_kein_budget:"No Budget",
     action_pausiert:"Paused", action_batterie_schutz:"Battery Protection", action_start:"Start", action_schlaf:"Sleep",
     morgen_prognose:"Tomorrow forecast:",
     infobox_connect_until:"🔌 Connect car by",
@@ -3304,6 +3369,13 @@ const TRANSLATIONS = {
     today_label:"today",
     cfg_haus_verbrauch:"Ø Daily House Consumption (kWh)",
     cfg_haus_verbrauch_hint:"Seed value for the learning function. Changing this resets the EMA for all weekdays.",
+    card_vehicle:"🚗 Vehicle (optional)",
+    card_vehicle_hint:"If your vehicle reports SOC to HA, the add-on can control more precisely and stop automatically when the target is reached.",
+    cfg_auto_soc_sensor:"Vehicle SOC Sensor",
+    cfg_auto_batterie_kwh:"Vehicle Battery Size (kWh)",
+    cfg_auto_ziel_soc:"Vehicle Target SOC",
+    hero_stat_auto_soc:"Car SOC",
+    action_auto_voll:"Car full",
     card_evcc_connection:"Wallbox Connection",
     cfg_wallbox_type:"Wallbox Control",
     cfg_wallbox_type_evcc:"evcc (recommended)",
@@ -3442,6 +3514,7 @@ function getActionLabels() {
     laden:           t("action_laden"),
     idle:            t("action_idle"),
     bereit:          t("action_bereit"),
+    auto_voll:       t("action_auto_voll"),
     kein_budget:     t("action_kein_budget"),
     pausiert:        t("action_pausiert"),
     batterie_schutz: t("action_batterie_schutz"),
@@ -3451,13 +3524,13 @@ function getActionLabels() {
 
 const ACTION_LABELS = {
   laden:"Laden", idle:"Bereit", bereit:"Warte auf PV / Auto voll",
-  kein_budget:"Kein Budget", pausiert:"Pausiert",
+  auto_voll:"Auto voll", kein_budget:"Kein Budget", pausiert:"Pausiert",
   batterie_schutz:"Batterieschutz", start:"Start", schlaf:"Schlaf"
 };
 
 const ACTION_ICONS = {
-  laden:"⚡", idle:"⏸", bereit:"🔋", kein_budget:"☁", pausiert:"⏸",
-  batterie_schutz:"🔋", start:"⏳", schlaf:"😴"
+  laden:"⚡", idle:"⏸", bereit:"🔋", auto_voll:"🚗",
+  kein_budget:"☁", pausiert:"⏸", batterie_schutz:"🔋", start:"⏳", schlaf:"😴"
 };
 
 function setHeroStatus(action) {
@@ -3587,6 +3660,16 @@ async function loadState() {
   document.getElementById("ziel-strom").textContent = fmt(s.ziel_strom_a, "A", 0);
   document.getElementById("batt-soc").textContent   = fmt(s.batterie_soc, "%", 0);
   document.getElementById("pv-leistung").textContent = fmt(s.pv_leistung_w, "W", 0);
+
+  // Auto-SOC Tile (nur wenn Sensor konfiguriert)
+  const autoSocTile = document.getElementById("auto-soc-tile");
+  const autoSocVal  = document.getElementById("auto-soc-val");
+  if (s.auto_soc != null) {
+    autoSocTile.style.display = "";
+    autoSocVal.textContent = Math.round(s.auto_soc) + "% / " + (s.auto_ziel_soc || 80) + "%";
+  } else {
+    autoSocTile.style.display = "none";
+  }
   document.getElementById("charged").textContent    = fmt(s.charged_today_kwh, "kWh");
 
   // Budget Card
@@ -3996,6 +4079,17 @@ async function loadConfig() {
     document.getElementById("cfg-interval").value  = c.update_interval_min || 5;
     document.getElementById("cfg-haus-verbrauch").value = c.haus_verbrauch_kwh ?? 10.0;
 
+    // Fahrzeug
+    const autoSocEl = document.getElementById("cfg-auto-soc");
+    if (autoSocEl) autoSocEl.value = c.sensor_auto_soc || "";
+    const autoBattEl = document.getElementById("cfg-auto-batt-kwh");
+    if (autoBattEl) autoBattEl.value = c.auto_batterie_kwh || 0;
+    const autoZielEl = document.getElementById("cfg-auto-ziel-soc");
+    if (autoZielEl) {
+      autoZielEl.value = c.auto_ziel_soc || 80;
+      document.getElementById("cfg-auto-ziel-soc-val").textContent = (c.auto_ziel_soc || 80) + "%";
+    }
+
     const zs = c.batterie_ziel_soc || 100;
     document.getElementById("cfg-ziel-soc").value         = zs;
     document.getElementById("cfg-ziel-soc-val").textContent = zs + "%";
@@ -4360,6 +4454,9 @@ async function saveConfig() {
     batterie_min_soc:        parseInt(document.getElementById("cfg-min-soc").value) || 15,
     update_interval_min:     parseInt(document.getElementById("cfg-interval").value) || 5,
     haus_verbrauch_kwh:      parseFloat(document.getElementById("cfg-haus-verbrauch").value) || 10.0,
+    sensor_auto_soc:         (document.getElementById("cfg-auto-soc")       || {}).value?.trim() || "",
+    auto_batterie_kwh:       parseFloat((document.getElementById("cfg-auto-batt-kwh") || {}).value) || 0,
+    auto_ziel_soc:           parseInt((document.getElementById("cfg-auto-ziel-soc")  || {}).value) || 80,
     budget_puffer_kwh:       parseFloat(document.getElementById("cfg-budget-puffer").value) || 0,
     ampel_gruen_kwh:         parseFloat(document.getElementById("cfg-ampel-gruen").value) ?? 0.5,
     ampel_gelb_kwh:          parseFloat(document.getElementById("cfg-ampel-gelb").value) ?? -1.0,
@@ -4660,6 +4757,9 @@ def api_config_get():
         "batterie_ziel_soc":       user_settings.get("batterie_ziel_soc", 100),
         "update_interval_min":     user_settings.get("update_interval_min", 5),
         "haus_verbrauch_kwh":      user_settings.get("haus_verbrauch_kwh", 10.0),
+        "sensor_auto_soc":         user_settings.get("sensor_auto_soc",   ""),
+        "auto_batterie_kwh":       user_settings.get("auto_batterie_kwh", 0.0),
+        "auto_ziel_soc":           user_settings.get("auto_ziel_soc",     80),
         "ampel_gruen_kwh":         user_settings.get("ampel_gruen_kwh", 0.5),
         "ampel_gelb_kwh":          user_settings.get("ampel_gelb_kwh", -1.0),
         "forecast_provider":       user_settings.get("forecast_provider", "forecast_solar"),
@@ -4735,6 +4835,10 @@ def api_config_save():
         "language":                str,
         # Lernwerte
         "haus_verbrauch_kwh":      float,
+        # Fahrzeug
+        "sensor_auto_soc":         str,
+        "auto_batterie_kwh":       float,
+        "auto_ziel_soc":           int,
         # Benachrichtigungen
         "notify_target":           str,
         "notify_budget_low_kwh":   float,
