@@ -139,8 +139,9 @@ def load_settings():
     # Lernwerte
     data.setdefault("addon_aktiv", True)
     data.setdefault("min_strom_a", 6)
+    data.setdefault("haus_verbrauch_kwh", 10.0)  # Startwert für EMA (vom Nutzer einzustellen)
     if "haus_ema_wochentag" not in data:
-        base = _DEV_CFG.get("haus_ema_kwh", 11.0)
+        base = float(data.get("haus_verbrauch_kwh", 10.0))
         data["haus_ema_wochentag"] = {str(i): base for i in range(7)}
     # Gelernte Batterie-Laderate (kW) pro Wochentag
     if "batt_fill_rate_wochentag" not in data:
@@ -2854,6 +2855,11 @@ TEMPLATE = r"""<!DOCTYPE html>
     <div class="card">
       <div class="card-title" data-i18n="card_system">System</div>
       <div style="margin-bottom:0.85rem;">
+        <label class="cfg-label" data-i18n="cfg_haus_verbrauch">Ø Tagesverbrauch Haus (kWh)</label>
+        <input type="number" id="cfg-haus-verbrauch" class="cfg-input" min="1" max="50" step="0.5">
+        <div style="font-size:0.72rem; color:var(--muted); margin-top:0.3rem;" data-i18n="cfg_haus_verbrauch_hint">Startwert für die Lernfunktion. Bei Änderung wird die EMA für alle Wochentage zurückgesetzt.</div>
+      </div>
+      <div style="margin-bottom:0.85rem;">
         <label class="cfg-label" data-i18n="cfg_update_interval">Update-Intervall (Min)</label>
         <input type="number" id="cfg-interval" class="cfg-input" min="1" max="60">
         <div style="font-size:0.72rem; color:var(--muted); margin-top:0.3rem;" data-i18n="cfg_interval_hint">Beim Laden immer 1 Minute</div>
@@ -3172,6 +3178,8 @@ const TRANSLATIONS = {
     day_monday:"Montag", day_tuesday:"Dienstag", day_wednesday:"Mittwoch",
     day_thursday:"Donnerstag", day_friday:"Freitag", day_saturday:"Samstag", day_sunday:"Sonntag",
     today_label:"heute",
+    cfg_haus_verbrauch:"Ø Tagesverbrauch Haus (kWh)",
+    cfg_haus_verbrauch_hint:"Startwert für die Lernfunktion. Bei Änderung wird die EMA für alle Wochentage zurückgesetzt.",
     card_evcc_connection:"Wallbox Verbindung",
     cfg_wallbox_type:"Wallbox-Steuerung",
     cfg_wallbox_type_evcc:"evcc (empfohlen)",
@@ -3294,6 +3302,8 @@ const TRANSLATIONS = {
     day_monday:"Monday", day_tuesday:"Tuesday", day_wednesday:"Wednesday",
     day_thursday:"Thursday", day_friday:"Friday", day_saturday:"Saturday", day_sunday:"Sunday",
     today_label:"today",
+    cfg_haus_verbrauch:"Ø Daily House Consumption (kWh)",
+    cfg_haus_verbrauch_hint:"Seed value for the learning function. Changing this resets the EMA for all weekdays.",
     card_evcc_connection:"Wallbox Connection",
     cfg_wallbox_type:"Wallbox Control",
     cfg_wallbox_type_evcc:"evcc (recommended)",
@@ -3984,6 +3994,7 @@ async function loadConfig() {
     document.getElementById("cfg-evcc-url").value  = c.evcc_url || "";
     document.getElementById("cfg-batt-kap").value  = c.batterie_kapazitaet_kwh || 9.0;
     document.getElementById("cfg-interval").value  = c.update_interval_min || 5;
+    document.getElementById("cfg-haus-verbrauch").value = c.haus_verbrauch_kwh ?? 10.0;
 
     const zs = c.batterie_ziel_soc || 100;
     document.getElementById("cfg-ziel-soc").value         = zs;
@@ -4348,6 +4359,7 @@ async function saveConfig() {
     batterie_ziel_soc:       parseInt(document.getElementById("cfg-ziel-soc").value) || 100,
     batterie_min_soc:        parseInt(document.getElementById("cfg-min-soc").value) || 15,
     update_interval_min:     parseInt(document.getElementById("cfg-interval").value) || 5,
+    haus_verbrauch_kwh:      parseFloat(document.getElementById("cfg-haus-verbrauch").value) || 10.0,
     budget_puffer_kwh:       parseFloat(document.getElementById("cfg-budget-puffer").value) || 0,
     ampel_gruen_kwh:         parseFloat(document.getElementById("cfg-ampel-gruen").value) ?? 0.5,
     ampel_gelb_kwh:          parseFloat(document.getElementById("cfg-ampel-gelb").value) ?? -1.0,
@@ -4647,6 +4659,7 @@ def api_config_get():
         "batterie_min_soc":        user_settings.get("batterie_min_soc", 15),
         "batterie_ziel_soc":       user_settings.get("batterie_ziel_soc", 100),
         "update_interval_min":     user_settings.get("update_interval_min", 5),
+        "haus_verbrauch_kwh":      user_settings.get("haus_verbrauch_kwh", 10.0),
         "ampel_gruen_kwh":         user_settings.get("ampel_gruen_kwh", 0.5),
         "ampel_gelb_kwh":          user_settings.get("ampel_gelb_kwh", -1.0),
         "forecast_provider":       user_settings.get("forecast_provider", "forecast_solar"),
@@ -4720,6 +4733,8 @@ def api_config_save():
         "latitude":                float,
         "bundesland":              str,
         "language":                str,
+        # Lernwerte
+        "haus_verbrauch_kwh":      float,
         # Benachrichtigungen
         "notify_target":           str,
         "notify_budget_low_kwh":   float,
@@ -4735,12 +4750,18 @@ def api_config_save():
     for key in bool_fields:
         if key in data:
             user_settings[key] = bool(data[key])
+    old_haus_verbrauch = user_settings.get("haus_verbrauch_kwh", 10.0)
     for key, cast in scalar_map.items():
         if key in data:
             try:
                 user_settings[key] = cast(data[key])
             except (ValueError, TypeError):
                 pass
+    # EMA zurücksetzen wenn Startwert geändert wurde
+    new_haus_verbrauch = user_settings.get("haus_verbrauch_kwh", 10.0)
+    if abs(new_haus_verbrauch - old_haus_verbrauch) > 0.05:
+        user_settings["haus_ema_wochentag"] = {str(i): new_haus_verbrauch for i in range(7)}
+        log.info(f"Haus-EMA zurückgesetzt auf {new_haus_verbrauch} kWh (Startwert geändert)")
     # Sensoren
     if "sensoren" in data and isinstance(data["sensoren"], dict):
         if "sensoren" not in user_settings:
