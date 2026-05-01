@@ -1525,17 +1525,26 @@ def control_loop():
                 evcc_set_mode("now")
                 start_schnell_regler()   # Sicherheit: Thread starten falls noch nicht läuft
         else:
-            target_mode = "minpv"
-            if ueberschuss_fallback:
-                grund = f"PV-Überschuss {einspeisung_w/1000:.1f} kW ins Netz → Auto laden | {target_a}A"
+            # Nur laden wenn genug PV-Überschuss ins Netz geht (mind. 6A × 230V = 1380W)
+            # → verhindert Batterieentladung durch evcc pv-Modus
+            min_ueberschuss_w = target_a * 230
+            if einspeisung_w >= min_ueberschuss_w:
+                target_mode = "pv"
+                if ueberschuss_fallback:
+                    grund = f"PV-Überschuss {einspeisung_w/1000:.1f} kW ins Netz → Auto laden | {target_a}A"
+                else:
+                    grund = f"Budget {budget_verfuegbar:.1f} kWh | Geladen {charged_today:.1f} kWh | {target_a}A"
+                if current_min_a != target_a:
+                    evcc_set_mincurrent(target_a)
+                if current_mode != target_mode:
+                    evcc_set_mode(target_mode)
+                action = "laden" if car_charging else "bereit"
             else:
-                grund = f"Budget {budget_verfuegbar:.1f} kWh | Geladen {charged_today:.1f} kWh | {target_a}A"
-            if current_min_a != target_a:
-                evcc_set_mincurrent(target_a)
-            if current_mode != target_mode:
-                evcc_set_mode(target_mode)
-            # Lädt gerade wirklich? Sonst "bereit" anzeigen (Auto voll oder warte auf PV)
-            action = "laden" if car_charging else "bereit"
+                # Zu wenig Überschuss → warten bis PV genug liefert
+                grund = f"Warte auf PV-Überschuss ({einspeisung_w:.0f}W < {min_ueberschuss_w:.0f}W für {target_a}A)"
+                if current_mode != "off":
+                    evcc_set_mode("off")
+                action = "bereit"
 
     _batt_charge_raw = ha_sensor(user_settings.get("growatt_battery_charge_power", "sensor.growatt_battery_charge_power")) or 0
     # Sensor liefert Watt → in kW umrechnen
