@@ -158,6 +158,10 @@ def load_settings():
     # Verbindung
     data.setdefault("evcc_url",     _DEV_CFG.get("evcc_url", "http://localhost:7070"))
     data.setdefault("loadpoint_id", int(_DEV_CFG.get("loadpoint_id", 1)))
+    # Wallbox 2 (optional)
+    data.setdefault("wb2_aktiv",        False)
+    data.setdefault("wb2_loadpoint_id", 2)
+    data.setdefault("wb2_budget_anteil", 50)   # % des Budgets für WB2 (WB1 bekommt 100-x%)
 
     # Batterie
     data.setdefault("wallbox_type",      "evcc")   # "evcc" | "ha_direct"
@@ -362,6 +366,7 @@ def _load_daily_budget():
         "soc_at_sunset":           None,
         "last_valid_remaining_pv": None,
         "laden_pausiert":          False,
+        "laden_schnell":           False,
     }
 
 
@@ -649,15 +654,15 @@ def _ha_direct_set_current(amps: int):
         log.error(f"HA direct set_current({amps}A): {e}")
 
 
-def evcc_loadpoint():
-    if user_settings.get("wallbox_type", "evcc") == "ha_direct":
+def evcc_loadpoint(lp_id: int | None = None):
+    if user_settings.get("wallbox_type", "evcc") == "ha_direct" and lp_id is None:
         return _ha_direct_loadpoint()
     try:
         r = requests.get(f"{get_evcc_url()}/api/state", timeout=8)
         lps = r.json().get("loadpoints", [])
-        lp_id = get_loadpoint_id()
+        _id = lp_id if lp_id is not None else get_loadpoint_id()
         state["evcc_online"] = True
-        return lps[lp_id - 1] if len(lps) >= lp_id else {}
+        return lps[_id - 1] if len(lps) >= _id else {}
     except Exception as e:
         log.warning(f"evcc nicht erreichbar: {e}")
         state["evcc_online"] = False
@@ -709,37 +714,50 @@ def evcc_charged_today(lp: dict | None = None) -> float:  # noqa: C901
     return round(total, 3)
 
 
-def evcc_set_mincurrent(amps: int):
-    if user_settings.get("wallbox_type", "evcc") == "ha_direct":
+def evcc_set_mincurrent(amps: int, lp_id: int | None = None):
+    if user_settings.get("wallbox_type", "evcc") == "ha_direct" and lp_id is None:
         _ha_direct_set_current(amps)
         return
+    _id = lp_id if lp_id is not None else get_loadpoint_id()
     try:
-        r = requests.post(f"{get_evcc_url()}/api/loadpoints/{get_loadpoint_id()}/mincurrent/{amps}", timeout=8)
-        log.info(f"evcc minCurrent={amps}A → {r.text.strip()}")
+        r = requests.post(f"{get_evcc_url()}/api/loadpoints/{_id}/mincurrent/{amps}", timeout=8)
+        log.info(f"evcc LP{_id} minCurrent={amps}A → {r.text.strip()}")
     except Exception as e:
-        log.error(f"evcc mincurrent: {e}")
+        log.error(f"evcc mincurrent LP{_id}: {e}")
 
 
-def evcc_set_maxcurrent(amps: int):
-    if user_settings.get("wallbox_type", "evcc") == "ha_direct":
+def evcc_set_maxcurrent(amps: int, lp_id: int | None = None):
+    if user_settings.get("wallbox_type", "evcc") == "ha_direct" and lp_id is None:
         _ha_direct_set_current(amps)
         return
+    _id = lp_id if lp_id is not None else get_loadpoint_id()
     try:
-        r = requests.post(f"{get_evcc_url()}/api/loadpoints/{get_loadpoint_id()}/maxcurrent/{amps}", timeout=8)
-        log.info(f"evcc maxCurrent={amps}A → {r.text.strip()}")
+        r = requests.post(f"{get_evcc_url()}/api/loadpoints/{_id}/maxcurrent/{amps}", timeout=8)
+        log.info(f"evcc LP{_id} maxCurrent={amps}A → {r.text.strip()}")
     except Exception as e:
-        log.error(f"evcc maxcurrent: {e}")
+        log.error(f"evcc maxcurrent LP{_id}: {e}")
 
 
-def evcc_set_mode(mode: str):
-    if user_settings.get("wallbox_type", "evcc") == "ha_direct":
+def evcc_set_mode(mode: str, lp_id: int | None = None):
+    if user_settings.get("wallbox_type", "evcc") == "ha_direct" and lp_id is None:
         _ha_direct_set_charging(mode in ("minpv", "pv", "now"))
         return
+    _id = lp_id if lp_id is not None else get_loadpoint_id()
     try:
-        r = requests.post(f"{get_evcc_url()}/api/loadpoints/{get_loadpoint_id()}/mode/{mode}", timeout=8)
-        log.info(f"evcc mode={mode} → {r.text.strip()}")
+        r = requests.post(f"{get_evcc_url()}/api/loadpoints/{_id}/mode/{mode}", timeout=8)
+        log.info(f"evcc LP{_id} mode={mode} → {r.text.strip()}")
     except Exception as e:
-        log.error(f"evcc mode: {e}")
+        log.error(f"evcc mode LP{_id}: {e}")
+
+
+def evcc_set_phases(phases: int, lp_id: int | None = None):
+    """Setzt die Phasenanzahl (1 oder 3) für ein evcc-Loadpoint."""
+    _id = lp_id if lp_id is not None else get_loadpoint_id()
+    try:
+        r = requests.post(f"{get_evcc_url()}/api/loadpoints/{_id}/phases/{phases}", timeout=8)
+        log.info(f"evcc LP{_id} phases={phases}Ph → {r.text.strip()[:60]}")
+    except Exception as e:
+        log.error(f"evcc phases LP{_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -757,11 +775,13 @@ _BAT_DISCH_MAX     = 10000  # W — Growatt-Default (Vollleistung freigeben)
 _REG_CHARGE_RATE   = 3036   # Charge Power Rate (0–100 %)
 _CHARGE_RATE_MAX   = 100    # 100 % = volle Ladeleistung
 
-_modbus_lock = threading.Lock()
+_modbus_lock         = threading.Lock()
+_force_refresh_event = threading.Event()   # wird gesetzt um Scheduler-Sleep zu unterbrechen
 
 
-def _growatt_write_register(register: int, value: int) -> bool:
-    """Schreibt einen Wert in ein Growatt Holding-Register via Modbus TCP."""
+def _growatt_write_register(register: int, value: int, retries: int = 3) -> bool:
+    """Schreibt einen Wert in ein Growatt Holding-Register via Modbus TCP.
+    Versucht es bis zu 'retries' Mal (Standard: 3) bei Verbindungsfehlern."""
     # Host/Port/Slave dynamisch aus Settings lesen (Fallback auf Konstanten)
     host  = user_settings.get("growatt_modbus_host",  _MODBUS_HOST)
     port  = int(user_settings.get("growatt_modbus_port",  _MODBUS_PORT))
@@ -769,22 +789,34 @@ def _growatt_write_register(register: int, value: int) -> bool:
     if not _PYMODBUS_OK:
         log.warning("pymodbus nicht verfügbar — Modbus-Schreiben übersprungen")
         return False
-    try:
-        with _modbus_lock:
-            client = _ModbusTcpClient(host, port=port, timeout=5)
-            if not client.connect():
-                log.error(f"Modbus TCP: Verbindung zu {host}:{port} fehlgeschlagen")
-                return False
-            result = client.write_register(register, value, slave=slave)
-            client.close()
-            if result.isError():
-                log.error(f"Modbus Schreibfehler Reg {register}={value}: {result}")
-                return False
-            log.info(f"Modbus OK: Reg {register} → {value}")
-            return True
-    except Exception as e:
-        log.error(f"Modbus Ausnahme: {e}")
-        return False
+    last_err = None
+    for attempt in range(1, retries + 1):
+        client = None
+        try:
+            with _modbus_lock:
+                client = _ModbusTcpClient(host, port=port, timeout=5)
+                if not client.connect():
+                    last_err = f"Verbindung zu {host}:{port} fehlgeschlagen"
+                else:
+                    result = client.write_register(register, value, slave=slave)
+                    if result.isError():
+                        last_err = str(result)
+                    else:
+                        if attempt > 1:
+                            log.info(f"Modbus OK (Versuch {attempt}): Reg {register} → {value}")
+                        else:
+                            log.info(f"Modbus OK: Reg {register} → {value}")
+                        return True
+        except Exception as e:
+            last_err = str(e)
+        finally:
+            if client is not None:
+                try: client.close()
+                except Exception: pass
+        if attempt < retries:
+            time.sleep(2)  # Etwas länger warten damit USR IOT Verbindung sauber schließt
+    log.error(f"Modbus Schreibfehler Reg {register}={value} (nach {retries} Versuchen): {last_err}")
+    return False
 
 
 def growatt_set_discharge_limit(watts: int):
@@ -860,6 +892,8 @@ def _schnell_regelung_thread():
         if batt_soc_now <= min_soc_val:
             log.info(f"[Schnell-Regler] Speicher bei min_soc ({batt_soc_now}% ≤ {min_soc_val}%) → Schnell-Modus deaktiviert")
             state["laden_schnell"] = False
+            _daily_budget["laden_schnell"] = False
+            _save_daily_budget(_daily_budget)
             break
 
         try:
@@ -1316,6 +1350,9 @@ def control_loop():
     lp          = evcc_loadpoint()
     car_connected = lp.get("connected", False)
     car_charging  = lp.get("charging",  False)
+    # Im normalen PV-Modus wird 1-phasig geladen (evcc phases=1 wird explizit gesetzt).
+    # Schnell-Modus: Schnell-Regler liest Phasen aus evcc und regelt auf Grid=0W.
+    lp_phases   = max(1, min(3, int(lp.get("activePhases") or lp.get("phases") or 1)))
 
     charged_today = evcc_charged_today(lp=lp)
 
@@ -1349,9 +1386,11 @@ def control_loop():
             "last_loop_ts": None, "pv_reset_done": False,
             "battery_needs_initial": None, "initial_daily_budget": None,
             "soc_at_sunset": None, "last_valid_remaining_pv": None,
+            "laden_schnell": False,
         })
         state["laden_pausiert"] = False
         state["laden_schnell"]  = False
+        _save_daily_budget(_daily_budget)
 
     # --- Budget-Komponenten ---
     rem_hours      = remaining_daylight_hours()
@@ -1616,13 +1655,23 @@ def control_loop():
             batt_charge_w_live = _batt_raw if _batt_raw <= 20000 else 0  # Plausibilitätscheck
             batt_charge_kw = batt_charge_w_live / 1000 if batt_charge_w_live > 20 else batt_charge_w_live
 
-            # Growatt Steuerung: Batterie-Laderate begrenzen damit PV fürs Auto frei wird
+            # Growatt Steuerung: Batterie nur drosseln wenn wir ohne Batterieladung
+            # rechnerisch genug Überschuss für das Auto hätten (PV − Haus ≥ 6A × 230V).
+            # Darunter bringt Drosseln nichts → Batterie lädt mit voller Leistung.
             growatt_aktiv = user_settings.get("growatt_steuerung_aktiv", False)
             batt_charge_anteil = user_settings.get("batt_charge_anteil", 60)
-            if growatt_aktiv:
+            # Normal-Modus: 1-phasig laden (6A × 230V = 1380W Minimum).
+            # Schnell-Modus übernimmt 3-phasiges Laden mit Speichernutzung.
+            min_auto_w     = 6 * 230   # 1380W
+            pv_ohne_batt_w = max(pv_leistung - haus_w, 0)
+            growatt_drosseln = growatt_aktiv and (pv_ohne_batt_w >= min_auto_w)
+
+            if growatt_drosseln:
                 growatt_set_charge_rate(batt_charge_anteil)
                 batt_hinweis = f" | Batt {batt_charge_anteil}% ({batt_charge_w_live:.0f}W)"
             else:
+                if growatt_aktiv:
+                    growatt_reset_charge_rate()
                 batt_hinweis = f" | Batt {batt_charge_w_live:.0f}W" if batt_charge_w_live > 50 else ""
 
             pv_fuer_auto_w = max(pv_leistung - haus_w - batt_charge_w_live, 0)
@@ -1632,21 +1681,132 @@ def control_loop():
                 target_mode = "now"
                 grund = (f"PV {pv_leistung/1000:.1f}kW − Haus {haus_w/1000:.1f}kW ({haus_quelle})"
                          f"{batt_hinweis} = {pv_fuer_auto_w/1000:.1f}kW → {auto_a}A | Budget {budget_verfuegbar:.1f} kWh")
-                # now-Modus: maxcurrent steuert die Ladeleistung (mincurrent wird ignoriert)
+                evcc_set_mincurrent(6)
+                if lp_phases != 1:
+                    evcc_set_phases(1)   # Normal-Modus immer 1-phasig
                 if current_max_a != auto_a:
                     evcc_set_maxcurrent(auto_a)
                 if current_mode != target_mode:
                     evcc_set_mode(target_mode)
                 action = "laden" if car_charging else "bereit"
             else:
-                # Zu wenig PV → warten, Growatt-Rate zurücksetzen
                 grund = (f"Warte auf PV ({pv_leistung:.0f}W − {haus_w:.0f}W Haus{batt_hinweis}"
-                         f" = {pv_fuer_auto_w:.0f}W < {6*230}W für 6A)")
-                growatt_reset_charge_rate()
+                         f" = {pv_fuer_auto_w:.0f}W < {min_auto_w}W für 6A)")
                 if current_mode != "off":
+                    evcc_set_mincurrent(6)
                     evcc_set_maxcurrent(16)
                     evcc_set_mode("off")
                 action = "bereit"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # WALLBOX 2 — optional, nur wenn wb2_aktiv und wallbox_type=evcc
+    # ═══════════════════════════════════════════════════════════════════════════
+    _wb2_aktiv_cfg = user_settings.get("wb2_aktiv", False)
+    _wb2_evcc_ok   = user_settings.get("wallbox_type", "evcc") == "evcc"
+    wb2_aktiv      = bool(_wb2_aktiv_cfg and _wb2_evcc_ok)
+    wb2_lp_id      = int(user_settings.get("wb2_loadpoint_id", 2))
+    wb2_anteil     = int(user_settings.get("wb2_budget_anteil", 50))
+
+    if wb2_aktiv:
+        lp2              = evcc_loadpoint(lp_id=wb2_lp_id)
+        car2_connected   = lp2.get("connected", False)
+        car2_charging    = lp2.get("charging",  False)
+        lp2_phases       = max(1, min(3, int(lp2.get("activePhases") or lp2.get("phases") or 1)))
+        current_mode_wb2  = lp2.get("mode", "off")
+        current_max_a_wb2 = lp2.get("maxCurrent", 16)
+        # Geladene Energie WB2: Live-Session genügt hier
+        charged_today_wb2 = round((lp2.get("sessionEnergy") or 0) / 1000.0, 3)
+
+        wb2_anteil_fak = wb2_anteil / 100.0
+        budget_wb2 = round(budget_verfuegbar_echt * wb2_anteil_fak, 2)
+
+        # PV-Überschuss für WB2 — nur wenn WB2-Auto verbunden
+        if car2_connected:
+            car1_charge_w  = float(lp.get("chargePower") or 0)
+            car2_charge_w  = float(lp2.get("chargePower") or 0)
+            _wb2_haus_korr = max(haus_last_w - car1_charge_w - car2_charge_w, 0)
+            _wb2_haus_w    = _wb2_haus_korr if 0 < _wb2_haus_korr < 8000 else haus_ema / max(daylight_total, 1) * 1000
+            _wb2_batt_raw  = ha_sensor(get_sensor("batt_ladeleistung")) or 0
+            _wb2_batt_w    = _wb2_batt_raw if _wb2_batt_raw <= 20000 else 0
+            pv_gesamt_auto_w = max(pv_leistung - _wb2_haus_w - _wb2_batt_w, 0)
+            pv_wb2_w = pv_gesamt_auto_w * wb2_anteil_fak
+        else:
+            pv_wb2_w = 0.0
+
+        action_wb2 = "idle"
+        grund_wb2  = ""
+        _min_auto_w = 6 * 230  # 1380W
+
+        if not car2_connected:
+            action_wb2 = "idle"
+            if current_mode_wb2 != "off":
+                evcc_set_mincurrent(6, lp_id=wb2_lp_id)
+                evcc_set_maxcurrent(16, lp_id=wb2_lp_id)
+                evcc_set_mode("off", lp_id=wb2_lp_id)
+
+        elif not user_settings.get("addon_aktiv", True):
+            action_wb2 = "schlaf"
+            grund_wb2  = "Add-on inaktiv"
+            if current_mode_wb2 != "off":
+                evcc_set_mincurrent(6, lp_id=wb2_lp_id)
+                evcc_set_maxcurrent(16, lp_id=wb2_lp_id)
+                evcc_set_mode("off", lp_id=wb2_lp_id)
+
+        elif state.get("laden_pausiert"):
+            action_wb2 = "pausiert"
+            grund_wb2  = "Manuell pausiert"
+            if current_mode_wb2 != "off":
+                evcc_set_mincurrent(6, lp_id=wb2_lp_id)
+                evcc_set_maxcurrent(16, lp_id=wb2_lp_id)
+                evcc_set_mode("off", lp_id=wb2_lp_id)
+
+        elif budget_wb2 <= 0:
+            action_wb2 = "kein_budget"
+            grund_wb2  = f"WB2 Budget 0 ({wb2_anteil}% von {budget_verfuegbar_echt:.1f} kWh)"
+            if current_mode_wb2 != "off":
+                evcc_set_mincurrent(6, lp_id=wb2_lp_id)
+                evcc_set_maxcurrent(16, lp_id=wb2_lp_id)
+                evcc_set_mode("off", lp_id=wb2_lp_id)
+
+        else:
+            auto_a_wb2 = max(min(int(pv_wb2_w / 230), 16), 0)
+            if auto_a_wb2 >= 6:
+                grund_wb2 = (f"WB2: {pv_wb2_w/1000:.1f}kW → {auto_a_wb2}A"
+                             f" | Budget {budget_wb2:.1f} kWh")
+                evcc_set_mincurrent(6, lp_id=wb2_lp_id)
+                if lp2_phases != 1:
+                    evcc_set_phases(1, lp_id=wb2_lp_id)
+                if current_max_a_wb2 != auto_a_wb2:
+                    evcc_set_maxcurrent(auto_a_wb2, lp_id=wb2_lp_id)
+                if current_mode_wb2 != "now":
+                    evcc_set_mode("now", lp_id=wb2_lp_id)
+                action_wb2 = "laden" if car2_charging else "bereit"
+            else:
+                grund_wb2 = (f"WB2: Warte auf PV ({pv_wb2_w:.0f}W"
+                             f" < {_min_auto_w}W für 6A)")
+                if current_mode_wb2 != "off":
+                    evcc_set_mincurrent(6, lp_id=wb2_lp_id)
+                    evcc_set_maxcurrent(16, lp_id=wb2_lp_id)
+                    evcc_set_mode("off", lp_id=wb2_lp_id)
+                action_wb2 = "bereit"
+
+        state.update({
+            "wb2_aktiv":             True,
+            "car2_connected":        car2_connected,
+            "car2_charging":         car2_charging,
+            "action_wb2":            action_wb2,
+            "grund_wb2":             grund_wb2,
+            "charged_today_wb2_kwh": charged_today_wb2,
+            "budget_wb2_kwh":        budget_wb2,
+        })
+        log.info(f"WB2 LP{wb2_lp_id}: Auto={'✓' if car2_connected else '✗'} | {action_wb2}")
+    else:
+        state.update({
+            "wb2_aktiv":      False,
+            "car2_connected": False,
+            "action_wb2":     "idle",
+            "grund_wb2":      "",
+        })
 
     if budget_verfuegbar_echt > 0.2:
         ansteck_deadline, ansteck_grund, ansteck_urgency, ansteck_minutes_left = calc_ansteck_deadline(
@@ -1836,7 +1996,8 @@ def scheduler():
         # Bei "laden" oder "pausiert" (Auto angesteckt): 1 Minute — evcc kann sonst selbst laden
         action = state.get("action")
         interval = 60 if action in ("laden", "pausiert") else get_update_interval() * 60
-        time.sleep(interval)
+        _force_refresh_event.wait(timeout=interval)
+        _force_refresh_event.clear()
 
 # ---------------------------------------------------------------------------
 # Web-UI
@@ -2823,6 +2984,29 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   </div><!-- /grid-3 -->
 
+  <!-- WB2 Status Card — nur sichtbar wenn wb2_aktiv -->
+  <div id="wb2-status-card" class="card" style="display:none; margin-bottom:1rem;">
+    <div class="card-title">⚡ Wallbox 2</div>
+    <div style="display:flex; gap:1rem; flex-wrap:wrap; align-items:center;">
+      <div>
+        <div style="font-size:0.72rem; color:var(--muted); margin-bottom:0.2rem;">Status</div>
+        <span id="wb2-action-badge">–</span>
+      </div>
+      <div>
+        <div style="font-size:0.72rem; color:var(--muted); margin-bottom:0.2rem;">Geladen</div>
+        <span style="font-family:'JetBrains Mono',monospace; font-weight:600;" id="wb2-charged">–</span>
+      </div>
+      <div>
+        <div style="font-size:0.72rem; color:var(--muted); margin-bottom:0.2rem;">Budget</div>
+        <span style="font-family:'JetBrains Mono',monospace; font-weight:600;" id="wb2-budget">–</span>
+      </div>
+      <div style="flex:1; min-width:12rem;">
+        <div style="font-size:0.72rem; color:var(--muted); margin-bottom:0.2rem;">Grund</div>
+        <div style="font-size:0.78rem;" id="wb2-grund">–</div>
+      </div>
+    </div>
+  </div>
+
   <div class="card" style="margin-bottom:1rem;">
     <div class="card-title collapsible" data-body="body-chart-budget" data-i18n="chart_budget_vs_charged">14 Tage — Budget vs. Geladen</div>
     <div id="body-chart-budget" class="card-body">
@@ -2935,6 +3119,36 @@ TEMPLATE = r"""<!DOCTYPE html>
             <input type="text" id="cfg-wb-current" class="cfg-input" placeholder="number.wallbox_charge_current">
             <button class="cfg-test-btn" onclick="openEntitySearch('cfg-wb-current')">🔍</button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Wallbox 2 (optional) -->
+    <div class="card">
+      <div class="card-title">⚡ Wallbox 2 <span style="font-size:0.75rem; color:var(--muted); font-weight:400;">(optional)</span></div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.85rem;">
+        <label class="cfg-label" style="margin:0;">Zweite Wallbox aktivieren</label>
+        <label class="toggle-switch">
+          <input type="checkbox" id="cfg-wb2-aktiv" onchange="toggleWb2()">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div id="wb2-fields" style="display:none;">
+        <div style="margin-bottom:0.85rem;">
+          <label class="cfg-label">evcc Loadpoint ID</label>
+          <select id="cfg-wb2-loadpoint-id" class="cfg-input">
+            <option value="2">Loadpoint 2</option>
+            <option value="3">Loadpoint 3</option>
+          </select>
+        </div>
+        <div>
+          <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:0.35rem;">
+            <label class="cfg-label" style="margin:0;">Budget-Aufteilung WB2</label>
+            <span style="font-size:1.1rem; font-weight:600; color:var(--blue,#60a5fa);">WB1 <span id="wb2-wb1-val">50</span>% / WB2 <span id="wb2-wb2-val">50</span>%</span>
+          </div>
+          <input type="range" id="cfg-wb2-budget-anteil" min="10" max="90" step="5" value="50"
+            oninput="document.getElementById('wb2-wb2-val').textContent=this.value; document.getElementById('wb2-wb1-val').textContent=100-this.value;">
+          <div style="font-size:0.72rem; color:var(--muted); margin-top:0.3rem;">Anteil des Tagesbudgets der für WB2 reserviert wird. WB1 bekommt den Rest.</div>
         </div>
       </div>
     </div>
@@ -3316,7 +3530,10 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   <!-- Speichern -->
   <div style="text-align:center; margin-bottom:2rem;">
-    <button class="cfg-save-btn" onclick="saveConfig()" data-i18n="btn_save_config">Konfiguration speichern</button>
+    <div style="display:flex; gap:0.75rem; flex-wrap:wrap;">
+      <button class="cfg-save-btn" onclick="saveConfig()" data-i18n="btn_save_config">Konfiguration speichern</button>
+      <button class="cfg-save-btn" onclick="forceRefresh()" style="background:var(--green); flex:0 0 auto; padding:0 1.2rem;" title="Sofort aktualisieren — überspringt die Warte-Zeit">🔄 Jetzt aktualisieren</button>
+    </div>
     <div id="cfg-save-result" style="font-size:0.85rem; margin-top:0.6rem; min-height:1.5rem;"></div>
   </div>
 
@@ -4048,6 +4265,28 @@ async function loadState() {
   } else {
     restBox.style.display = "none";
   }
+
+  // WB2 Status Card
+  const wb2Card = document.getElementById("wb2-status-card");
+  if (s.wb2_aktiv) {
+    wb2Card.style.display = "block";
+    const wb2Act = s.action_wb2 || "idle";
+    const wb2BadgeClass = wb2Act === "laden" ? "badge-green"
+                        : wb2Act === "bereit" ? "badge-blue"
+                        : wb2Act === "kein_budget" ? "badge-red"
+                        : wb2Act === "pausiert" ? "badge-yellow"
+                        : "badge-gray";
+    const wb2Labels = { laden:"Lädt", bereit:"Bereit", idle:"Kein Auto", kein_budget:"Kein Budget",
+                        pausiert:"Pausiert", schlaf:"Inaktiv" };
+    document.getElementById("wb2-action-badge").innerHTML =
+      '<span class="badge ' + wb2BadgeClass + '">' + (wb2Labels[wb2Act] || wb2Act) + '</span>' +
+      (s.car2_connected ? ' <span class="badge badge-gray">verbunden</span>' : '');
+    document.getElementById("wb2-charged").textContent = s.charged_today_wb2_kwh != null ? fmt(s.charged_today_wb2_kwh, "kWh") : "–";
+    document.getElementById("wb2-budget").textContent  = s.budget_wb2_kwh        != null ? fmt(s.budget_wb2_kwh,        "kWh") : "–";
+    document.getElementById("wb2-grund").textContent   = s.grund_wb2 || "–";
+  } else {
+    wb2Card.style.display = "none";
+  }
 }
 
 // ─── Charts ───────────────────────────────────────────────────────────────────
@@ -4266,6 +4505,20 @@ function buildSensorFields() {
   ).join("");
 }
 
+async function forceRefresh() {
+  const resultEl = document.getElementById("cfg-save-result");
+  resultEl.innerHTML = '<span style="color:var(--muted)">Aktualisierung wird ausgelöst…</span>';
+  try {
+    const d = await (await fetch(BASE + "/api/refresh", {method:"POST"})).json();
+    if (d.ok) {
+      resultEl.innerHTML = '<span style="color:var(--green)">✓ Zyklus gestartet — Daten aktualisieren sich in wenigen Sekunden</span>';
+    }
+  } catch {
+    resultEl.innerHTML = '<span style="color:var(--red)">Verbindungsfehler</span>';
+  }
+  setTimeout(() => resultEl.innerHTML = "", 4000);
+}
+
 function onGrowattAktivChange() {
   const aktiv = document.getElementById("cfg-growatt-aktiv")?.checked;
   const panel = document.getElementById("growatt-settings");
@@ -4404,7 +4657,23 @@ async function loadConfig() {
     document.getElementById("cfg-notify-budget-kwh").value      = c.notify_budget_low_kwh ?? 0.5;
     document.getElementById("cfg-notify-deadline").checked      = !!c.notify_deadline_urgent;
     document.getElementById("cfg-notify-laden-fertig").checked  = !!c.notify_laden_fertig;
+
+    // Wallbox 2
+    const wb2Aktiv = !!c.wb2_aktiv;
+    document.getElementById("cfg-wb2-aktiv").checked = wb2Aktiv;
+    document.getElementById("wb2-fields").style.display = wb2Aktiv ? "block" : "none";
+    const wb2Lp = c.wb2_loadpoint_id || 2;
+    document.getElementById("cfg-wb2-loadpoint-id").value = wb2Lp;
+    const wb2Ant = c.wb2_budget_anteil ?? 50;
+    document.getElementById("cfg-wb2-budget-anteil").value = wb2Ant;
+    document.getElementById("wb2-wb2-val").textContent = wb2Ant;
+    document.getElementById("wb2-wb1-val").textContent = 100 - wb2Ant;
   } catch(e) { console.error("loadConfig:", e); }
+}
+
+function toggleWb2() {
+  const aktiv = document.getElementById("cfg-wb2-aktiv").checked;
+  document.getElementById("wb2-fields").style.display = aktiv ? "block" : "none";
 }
 
 // Hinweistext + Defaults je nach gewähltem Anbieter
@@ -4714,6 +4983,9 @@ async function saveConfig() {
     growatt_modbus_port:     parseInt((document.getElementById("cfg-growatt-port")  || {}).value) || 21,
     growatt_modbus_slave:    parseInt((document.getElementById("cfg-growatt-slave") || {}).value) || 1,
     batt_charge_anteil:      parseInt((document.getElementById("cfg-batt-anteil")   || {}).value) || 60,
+    wb2_aktiv:               document.getElementById("cfg-wb2-aktiv")?.checked ?? false,
+    wb2_loadpoint_id:        parseInt((document.getElementById("cfg-wb2-loadpoint-id") || {}).value) || 2,
+    wb2_budget_anteil:       parseInt((document.getElementById("cfg-wb2-budget-anteil") || {}).value) || 50,
     sensoren,
   };
   const resultEl = document.getElementById("cfg-save-result");
@@ -4966,12 +5238,23 @@ def api_pause():
     return jsonify({"ok": True, "laden_pausiert": pausiert})
 
 
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    """Löst sofort einen neuen Steuer-Zyklus aus (überspringt die Warte-Zeit)."""
+    _force_refresh_event.set()
+    log.info("Manuelles Refresh ausgelöst")
+    return jsonify({"ok": True})
+
+
 @app.route("/api/schnell", methods=["POST"])
 def api_schnell():
     """Modul 5: Budget-schnell umschalten — now-Modus + Schnell-Regler-Thread."""
     data  = request.get_json(force=True)
     aktiv = bool(data.get("aktiv", False))
     state["laden_schnell"] = aktiv
+    # Schnell-State auf Disk persistieren — überlebt Neustarts/Rebuilds
+    _daily_budget["laden_schnell"] = aktiv
+    _save_daily_budget(_daily_budget)
     log.info(f"Budget-schnell: {'aktiviert' if aktiv else 'deaktiviert'}")
     if aktiv:
         if state.get("car_connected"):
@@ -4979,6 +5262,7 @@ def api_schnell():
         start_schnell_regler()
     else:
         evcc_set_maxcurrent(16)    # maxcurrent zurücksetzen
+    _force_refresh_event.set()     # Main-Loop sofort anstoßen → Anzeige aktualisieren
     return jsonify({"ok": True, "laden_schnell": aktiv})
 
 
@@ -5027,6 +5311,10 @@ def api_config_get():
         "growatt_modbus_slave":    user_settings.get("growatt_modbus_slave", 1),
         "batt_charge_anteil":      user_settings.get("batt_charge_anteil",   60),
         "haus_last_modus":         user_settings.get("haus_last_modus",      "ema"),
+        # Wallbox 2
+        "wb2_aktiv":               user_settings.get("wb2_aktiv",         False),
+        "wb2_loadpoint_id":        user_settings.get("wb2_loadpoint_id",  2),
+        "wb2_budget_anteil":       user_settings.get("wb2_budget_anteil", 50),
     })
 
 
@@ -5105,9 +5393,12 @@ def api_config_save():
         "growatt_modbus_port":     int,
         "growatt_modbus_slave":    int,
         "batt_charge_anteil":      int,
+        # Wallbox 2
+        "wb2_loadpoint_id":        int,
+        "wb2_budget_anteil":       int,
     }
     bool_fields = ["has_battery", "notify_budget_low", "notify_deadline_urgent", "notify_laden_fertig",
-                   "growatt_steuerung_aktiv"]
+                   "growatt_steuerung_aktiv", "wb2_aktiv"]
     for key in bool_fields:
         if key in data:
             user_settings[key] = bool(data[key])
@@ -5223,6 +5514,11 @@ def _worker_init():
     if _daily_budget.get("laden_pausiert"):
         state["laden_pausiert"] = True
         log.info("Pause-State wiederhergestellt (war vor Neustart aktiv)")
+    if _daily_budget.get("laden_schnell"):
+        state["laden_schnell"] = True
+        evcc_set_mode("now")
+        start_schnell_regler()
+        log.info("Schnell-Laden wiederhergestellt (war vor Neustart aktiv)")
     log.info("=" * 55)
     log.info("Smart EV Charger gestartet")
     log.info(f"evcc: {get_evcc_url()} | HA: {'Supervisor' if SUPERVISOR_TOKEN else _DEV_CFG.get('ha_url','?')}")
