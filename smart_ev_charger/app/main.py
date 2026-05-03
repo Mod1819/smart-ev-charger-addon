@@ -5020,6 +5020,13 @@ def api_config_get():
         "notify_budget_low_kwh":   user_settings.get("notify_budget_low_kwh",  0.5),
         "notify_deadline_urgent":  user_settings.get("notify_deadline_urgent", False),
         "notify_laden_fertig":     user_settings.get("notify_laden_fertig",    False),
+        # Growatt Direkt-Steuerung
+        "growatt_steuerung_aktiv": user_settings.get("growatt_steuerung_aktiv", False),
+        "growatt_modbus_host":     user_settings.get("growatt_modbus_host",  "192.168.0.47"),
+        "growatt_modbus_port":     user_settings.get("growatt_modbus_port",  21),
+        "growatt_modbus_slave":    user_settings.get("growatt_modbus_slave", 1),
+        "batt_charge_anteil":      user_settings.get("batt_charge_anteil",   60),
+        "haus_last_modus":         user_settings.get("haus_last_modus",      "ema"),
     })
 
 
@@ -5091,8 +5098,16 @@ def api_config_save():
         "wallbox_energy":          str,
         "wallbox_switch":          str,
         "wallbox_current":         str,
+        # Haus-Last-Modus
+        "haus_last_modus":         str,
+        # Growatt Direkt-Steuerung
+        "growatt_modbus_host":     str,
+        "growatt_modbus_port":     int,
+        "growatt_modbus_slave":    int,
+        "batt_charge_anteil":      int,
     }
-    bool_fields = ["has_battery", "notify_budget_low", "notify_deadline_urgent", "notify_laden_fertig"]
+    bool_fields = ["has_battery", "notify_budget_low", "notify_deadline_urgent", "notify_laden_fertig",
+                   "growatt_steuerung_aktiv"]
     for key in bool_fields:
         if key in data:
             user_settings[key] = bool(data[key])
