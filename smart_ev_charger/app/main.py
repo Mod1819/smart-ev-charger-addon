@@ -107,6 +107,8 @@ SENSOREN_DEF = [
     ("pv_leistung",    "PV Leistung aktuell",      "Aktuelle PV-Erzeugungsleistung (W)",                           "sensor.growatt_pv_power_total"),
     ("haus_last",      "Haus Gesamtlast heute",    "Gesamter Hausverbrauch heute inkl. Auto-Laden (kWh)",          "sensor.growatt_today_s_yield"),
     ("grid_power",     "Netzleistung",             "Aktuelle Netzleistung (W) — negativ = Einspeisung ins Netz",   "sensor.grid_power_evcc"),
+    ("haus_last_w",    "Haus Last aktuell (W)",    "Aktueller Hausverbrauch in Watt (z.B. sensor.growatt_total_load_power)", "sensor.growatt_total_load_power"),
+    ("batt_ladeleistung", "Batterie Ladeleistung (W)", "Aktuelle Batterieladeleistung in Watt — für Echtzeit-Berechnung (z.B. sensor.growatt_battery_charge_power)", "sensor.growatt_battery_charge_power"),
 ]
 SENSOREN_DEFAULTS = {k: d for k, _, _, d in SENSOREN_DEF}
 
@@ -180,6 +182,14 @@ def load_settings():
 
     # Budget-Puffer
     data.setdefault("budget_puffer_kwh", 0.0)
+    data.setdefault("haus_last_modus", "echtzeit")  # "echtzeit" | "ema"
+
+    # Growatt Direkt-Steuerung (Batterie-Laderate begrenzen wenn Auto lädt)
+    data.setdefault("growatt_steuerung_aktiv", False)
+    data.setdefault("growatt_modbus_host",  "192.168.0.47")
+    data.setdefault("growatt_modbus_port",  21)
+    data.setdefault("growatt_modbus_slave", 1)
+    data.setdefault("batt_charge_anteil",   60)  # % der PV-Leistung für Batterie
 
     # Benachrichtigungen
     data.setdefault("notify_target",          "")     # HA-Notification-Service, z.B. "mobile_app_iphone"
@@ -209,7 +219,9 @@ def load_settings():
     s.setdefault("batterie_soc",   _DEV_CFG.get("sensor_batterie_soc", SENSOREN_DEFAULTS["batterie_soc"]))
     s.setdefault("pv_leistung",    _DEV_CFG.get("sensor_pv_leistung",  SENSOREN_DEFAULTS["pv_leistung"]))
     s.setdefault("haus_last",      _DEV_CFG.get("sensor_haus_last",    SENSOREN_DEFAULTS["haus_last"]))
-    s.setdefault("grid_power",     SENSOREN_DEFAULTS["grid_power"])
+    s.setdefault("grid_power",        SENSOREN_DEFAULTS["grid_power"])
+    s.setdefault("haus_last_w",       SENSOREN_DEFAULTS["haus_last_w"])
+    s.setdefault("batt_ladeleistung", SENSOREN_DEFAULTS["batt_ladeleistung"])
 
     return data
 
@@ -734,30 +746,36 @@ def evcc_set_mode(mode: str):
 # Growatt Modbus TCP — BatDischargePowerLimit
 # ---------------------------------------------------------------------------
 # USR IOT Adapter: 192.168.0.47:21  (Modbus RTU over TCP, Slave-ID 1)
-# Register 3036 = BatDischargePowerLimit (W, Schreibwert = Watt, Max 10000)
+# Growatt Modbus Register
 # Growatt MOD TL3-XH Protokoll v1.24, Holding-Register Bereich 3000–3249
 # ---------------------------------------------------------------------------
-_MODBUS_HOST    = "192.168.0.47"
-_MODBUS_PORT    = 21
-_MODBUS_SLAVE   = 1
-_REG_BAT_DISCH  = 3036   # BatDischargePowerLimit (W)
-_BAT_DISCH_MAX  = 10000  # W — Growatt-Default (Vollleistung freigeben)
+_MODBUS_HOST       = "192.168.0.47"
+_MODBUS_PORT       = 21
+_MODBUS_SLAVE      = 1
+_REG_BAT_DISCH     = 3036   # BatDischargePowerLimit (W)
+_BAT_DISCH_MAX     = 10000  # W — Growatt-Default (Vollleistung freigeben)
+_REG_CHARGE_RATE   = 3036   # Charge Power Rate (0–100 %)
+_CHARGE_RATE_MAX   = 100    # 100 % = volle Ladeleistung
 
 _modbus_lock = threading.Lock()
 
 
 def _growatt_write_register(register: int, value: int) -> bool:
     """Schreibt einen Wert in ein Growatt Holding-Register via Modbus TCP."""
+    # Host/Port/Slave dynamisch aus Settings lesen (Fallback auf Konstanten)
+    host  = user_settings.get("growatt_modbus_host",  _MODBUS_HOST)
+    port  = int(user_settings.get("growatt_modbus_port",  _MODBUS_PORT))
+    slave = int(user_settings.get("growatt_modbus_slave", _MODBUS_SLAVE))
     if not _PYMODBUS_OK:
         log.warning("pymodbus nicht verfügbar — Modbus-Schreiben übersprungen")
         return False
     try:
         with _modbus_lock:
-            client = _ModbusTcpClient(_MODBUS_HOST, port=_MODBUS_PORT, timeout=5)
+            client = _ModbusTcpClient(host, port=port, timeout=5)
             if not client.connect():
-                log.error(f"Modbus TCP: Verbindung zu {_MODBUS_HOST}:{_MODBUS_PORT} fehlgeschlagen")
+                log.error(f"Modbus TCP: Verbindung zu {host}:{port} fehlgeschlagen")
                 return False
-            result = client.write_register(register, value, slave=_MODBUS_SLAVE)
+            result = client.write_register(register, value, slave=slave)
             client.close()
             if result.isError():
                 log.error(f"Modbus Schreibfehler Reg {register}={value}: {result}")
@@ -780,6 +798,36 @@ def growatt_reset_discharge_limit():
     """Setzt BatDischargePowerLimit zurück auf Maximum (Growatt-Default)."""
     dlog(f"[Modbus] BatDischargePowerLimit reset → {_BAT_DISCH_MAX} W", "info")
     _growatt_write_register(_REG_BAT_DISCH, _BAT_DISCH_MAX)
+
+
+# Merkt sich die zuletzt gesetzte Charge-Rate um unnötige Modbus-Schreibvorgänge zu vermeiden
+_last_growatt_charge_rate: int = _CHARGE_RATE_MAX
+
+def growatt_set_charge_rate(percent: int) -> bool:
+    """Setzt Batterie-Laderate (Register 3036, 0–100%). Nur wenn Growatt-Steuerung aktiv."""
+    global _last_growatt_charge_rate
+    if not user_settings.get("growatt_steuerung_aktiv", False):
+        return False
+    percent = max(0, min(100, int(percent)))
+    if percent == _last_growatt_charge_rate:
+        return True   # kein redundanter Schreibvorgang
+    ok = _growatt_write_register(_REG_CHARGE_RATE, percent)
+    if ok:
+        _last_growatt_charge_rate = percent
+        dlog(f"[Growatt] Charge Rate → {percent}%", "info")
+    return ok
+
+def growatt_reset_charge_rate():
+    """Setzt Batterie-Laderate zurück auf 100% (volle Leistung)."""
+    global _last_growatt_charge_rate
+    if not user_settings.get("growatt_steuerung_aktiv", False):
+        return
+    if _last_growatt_charge_rate == _CHARGE_RATE_MAX:
+        return   # bereits auf 100%, kein Schreibvorgang nötig
+    ok = _growatt_write_register(_REG_CHARGE_RATE, _CHARGE_RATE_MAX)
+    if ok:
+        _last_growatt_charge_rate = _CHARGE_RATE_MAX
+        dlog("[Growatt] Charge Rate reset → 100%", "info")
 
 
 # ---------------------------------------------------------------------------
@@ -1262,6 +1310,7 @@ def control_loop():
         pv_heute = pv_heute_raw
     haus_last   = ha_sensor(get_sensor("haus_last"))
     grid_power  = ha_sensor(get_sensor("grid_power"))
+    haus_last_w = ha_sensor(get_sensor("haus_last_w")) or 0  # Echtzeit-Hausverbrauch in Watt (ohne Batterie, aber inkl. Auto wenn lädt)
 
     # --- evcc lesen ---
     lp          = evcc_loadpoint()
@@ -1474,6 +1523,11 @@ def control_loop():
     batt_ok       = (batt_soc >= get_batt_min_soc()) if has_battery() else True
     current_mode  = lp.get("mode", "off")
     current_min_a = lp.get("minCurrent", 6)
+    current_max_a = lp.get("maxCurrent", 16)
+
+    # Standardwerte — werden ggf. in der Ladelogik überschrieben
+    batt_charge_w_live = 0
+    batt_charge_kw     = 0.0
 
     if not user_settings.get("addon_aktiv", True):
         # Schlaf-Modus: Add-on greift nicht in evcc ein — evcc läuft frei
@@ -1483,25 +1537,37 @@ def control_loop():
     elif state.get("laden_pausiert"):
         action = "pausiert"
         grund  = "Manuell pausiert"
+        growatt_reset_charge_rate()
         if current_mode != "off":
+            evcc_set_maxcurrent(16)
+            evcc_set_mincurrent(6)
             evcc_set_mode("off")
 
     elif not car_connected:
         action = "idle"
         grund  = ""
+        growatt_reset_charge_rate()
         if current_mode != "off":
+            evcc_set_maxcurrent(16)
+            evcc_set_mincurrent(6)
             evcc_set_mode("off")
 
     elif auto_voll:
         action = "auto_voll"
         grund  = f"Fahrzeug-SOC {auto_soc:.0f}% ≥ Ziel {_auto_ziel_soc}%"
+        growatt_reset_charge_rate()
         if current_mode != "off":
+            evcc_set_maxcurrent(16)
+            evcc_set_mincurrent(6)
             evcc_set_mode("off")
 
     elif not batt_ok:
         action = "batterie_schutz"
         grund  = f"Speicher-SOC {batt_soc:.0f}% < Notfall-Minimum {get_batt_min_soc()}%"
+        growatt_reset_charge_rate()
         if current_mode != "off":
+            evcc_set_maxcurrent(16)
+            evcc_set_mincurrent(6)
             evcc_set_mode("off")
 
     elif not budget_ok:
@@ -1510,13 +1576,18 @@ def control_loop():
             grund = f"Kein PV-Rest heute ({remaining_pv_forecast:.2f} kWh Forecast, {pv_leistung:.0f} W)"
         else:
             grund = f"Budget aufgebraucht — {charged_today:.1f} kWh geladen von {initial_daily_budget or 0:.1f} kWh"
+        growatt_reset_charge_rate()
         if current_mode != "off":
+            evcc_set_maxcurrent(16)
+            evcc_set_mincurrent(6)
             evcc_set_mode("off")
 
     else:
         if laden_schnell:
             action      = "laden"
             # Modul 5: Schnell-Laden → now-Modus, maxcurrent regelt Schnell-Regler-Thread
+            # Growatt-Rate auf 100% im Schnell-Modus (kein Eingriff)
+            growatt_reset_charge_rate()
             target_mode = "now"
             cur_max_a   = int(lp.get("maxCurrent") or 16)
             grund = (f"⚡ Schnell | PV {pv_leistung/1000:.1f}kW"
@@ -1525,36 +1596,67 @@ def control_loop():
                 evcc_set_mode("now")
                 start_schnell_regler()   # Sicherheit: Thread starten falls noch nicht läuft
         else:
-            # Nur laden wenn genug PV-Überschuss ins Netz geht (mind. 6A × 230V = 1380W)
-            # → verhindert Batterieentladung durch evcc pv-Modus
-            min_ueberschuss_w = target_a * 230
-            if einspeisung_w >= min_ueberschuss_w:
-                target_mode = "pv"
-                if ueberschuss_fallback:
-                    grund = f"PV-Überschuss {einspeisung_w/1000:.1f} kW ins Netz → Auto laden | {target_a}A"
-                else:
-                    grund = f"Budget {budget_verfuegbar:.1f} kWh | Geladen {charged_today:.1f} kWh | {target_a}A"
-                if current_min_a != target_a:
-                    evcc_set_mincurrent(target_a)
+            # Growatt hält Grid bei 0W durch Batterieladung → evcc pv-Modus sieht nie Überschuss.
+            # Lösung: now-Modus mit selbst berechnetem Strom = (PV - Haus - Batt) / 230V
+            # Echtzeit-Sensor bevorzugt, Fallback auf EMA-Rate
+            haus_last_modus = user_settings.get("haus_last_modus", "echtzeit")
+            # Sensor enthält auch Auto-Ladeleistung wenn gerade geladen wird → rausrechnen
+            car_charge_w = float(lp.get("chargePower") or 0)
+            haus_last_w_korr = max(haus_last_w - car_charge_w, 0)
+            haus_last_plausibel = 0 < haus_last_w_korr < 8000
+            if haus_last_modus == "echtzeit" and haus_last_plausibel:
+                haus_w = haus_last_w_korr
+                haus_quelle = f"Sensor ({haus_last_w:.0f}W−{car_charge_w:.0f}W Auto)" if car_charge_w > 50 else "Sensor"
+            else:
+                haus_w = haus_ema / max(daylight_total, 1) * 1000
+                haus_quelle = "EMA" if haus_last_modus != "echtzeit" else f"EMA (Sensor {haus_last_w_korr:.0f}W unplausibel)"
+
+            # Batterie-Ladeleistung lesen (für korrekte Überschuss-Berechnung)
+            _batt_raw = ha_sensor(get_sensor("batt_ladeleistung")) or 0
+            batt_charge_w_live = _batt_raw if _batt_raw <= 20000 else 0  # Plausibilitätscheck
+            batt_charge_kw = batt_charge_w_live / 1000 if batt_charge_w_live > 20 else batt_charge_w_live
+
+            # Growatt Steuerung: Batterie-Laderate begrenzen damit PV fürs Auto frei wird
+            growatt_aktiv = user_settings.get("growatt_steuerung_aktiv", False)
+            batt_charge_anteil = user_settings.get("batt_charge_anteil", 60)
+            if growatt_aktiv:
+                growatt_set_charge_rate(batt_charge_anteil)
+                batt_hinweis = f" | Batt {batt_charge_anteil}% ({batt_charge_w_live:.0f}W)"
+            else:
+                batt_hinweis = f" | Batt {batt_charge_w_live:.0f}W" if batt_charge_w_live > 50 else ""
+
+            pv_fuer_auto_w = max(pv_leistung - haus_w - batt_charge_w_live, 0)
+            auto_a = max(min(int(pv_fuer_auto_w / 230), 16), 0)
+
+            if auto_a >= 6:
+                target_mode = "now"
+                grund = (f"PV {pv_leistung/1000:.1f}kW − Haus {haus_w/1000:.1f}kW ({haus_quelle})"
+                         f"{batt_hinweis} = {pv_fuer_auto_w/1000:.1f}kW → {auto_a}A | Budget {budget_verfuegbar:.1f} kWh")
+                # now-Modus: maxcurrent steuert die Ladeleistung (mincurrent wird ignoriert)
+                if current_max_a != auto_a:
+                    evcc_set_maxcurrent(auto_a)
                 if current_mode != target_mode:
                     evcc_set_mode(target_mode)
                 action = "laden" if car_charging else "bereit"
             else:
-                # Zu wenig Überschuss → warten bis PV genug liefert
-                grund = f"Warte auf PV-Überschuss ({einspeisung_w:.0f}W < {min_ueberschuss_w:.0f}W für {target_a}A)"
+                # Zu wenig PV → warten, Growatt-Rate zurücksetzen
+                grund = (f"Warte auf PV ({pv_leistung:.0f}W − {haus_w:.0f}W Haus{batt_hinweis}"
+                         f" = {pv_fuer_auto_w:.0f}W < {6*230}W für 6A)")
+                growatt_reset_charge_rate()
                 if current_mode != "off":
+                    evcc_set_maxcurrent(16)
                     evcc_set_mode("off")
                 action = "bereit"
 
-    _batt_charge_raw = ha_sensor(user_settings.get("growatt_battery_charge_power", "sensor.growatt_battery_charge_power")) or 0
-    # Sensor liefert Watt → in kW umrechnen
-    batt_charge_kw = _batt_charge_raw / 1000 if _batt_charge_raw > 20 else _batt_charge_raw
-    ansteck_deadline, ansteck_grund, ansteck_urgency, ansteck_minutes_left = calc_ansteck_deadline(
-        initial_daily_budget or 0, remaining_pv_forecast, pv_leistung, rem_hours, _daily_budget,
-        haus_ema=haus_ema, daylight_total=daylight_total,
-        batt_soc=batt_soc, ziel_soc=ziel_soc, batt_kap=batt_kap,
-        batt_charge_kw=batt_charge_kw
-    )
+    if budget_verfuegbar_echt > 0.2:
+        ansteck_deadline, ansteck_grund, ansteck_urgency, ansteck_minutes_left = calc_ansteck_deadline(
+            initial_daily_budget or 0, remaining_pv_forecast, pv_leistung, rem_hours, _daily_budget,
+            haus_ema=haus_ema, daylight_total=daylight_total,
+            batt_soc=batt_soc, ziel_soc=ziel_soc, batt_kap=batt_kap,
+            batt_charge_kw=batt_charge_kw
+        )
+    else:
+        ansteck_deadline, ansteck_grund, ansteck_urgency, ansteck_minutes_left = None, None, None, None
 
     charge_power_kw = (lp.get("chargePower") or 0) / 1000
     if charge_power_kw < 0.1:
@@ -1660,6 +1762,10 @@ def control_loop():
         "available_for_car_kwh":    budget_verfuegbar_echt,
         "budget_kwh":               budget_verfuegbar_echt,
         "daily_budget_kwh":         round(initial_daily_budget or 0, 2),
+        # Growatt Steuerung
+        "growatt_steuerung_aktiv":  user_settings.get("growatt_steuerung_aktiv", False),
+        "growatt_charge_rate_pct":  _last_growatt_charge_rate,
+        "batt_ladeleistung_w":      round(batt_charge_w_live, 0),
     })
 
     # SOC bei Sonnenuntergang einmalig speichern (Abend-Lernfunktion)
@@ -3058,6 +3164,16 @@ TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
     <div style="margin-bottom:0.85rem;">
+      <div style="display:flex; align-items:center; gap:0.75rem;">
+        <label class="toggle-switch">
+          <input type="checkbox" id="cfg-haus-last-echtzeit" onchange="updateHausLastSwitch(this.checked?'echtzeit':'ema', _lastCfg)">
+          <span class="toggle-slider"></span>
+        </label>
+        <span class="cfg-label" style="margin:0;" data-i18n="cfg_haus_last_modus">⚡ Echtzeit-Hausverbrauch</span>
+      </div>
+      <div id="haus-last-echtzeit-hint" style="font-size:0.72rem; color:var(--muted); margin-top:0.35rem;"></div>
+    </div>
+    <div style="margin-bottom:0.85rem;">
       <label class="cfg-label" data-i18n="cfg_ampel_green">🟢 Grün ab (kWh) — Budget sicher</label>
       <input type="number" id="cfg-ampel-gruen" class="cfg-input" min="-5" max="10" step="0.1">
       <div style="font-size:0.72rem; color:var(--muted); margin-top:0.25rem;" data-i18n="ampel_green_hint">Budget ≥ dieser Wert → grün</div>
@@ -3066,6 +3182,57 @@ TEMPLATE = r"""<!DOCTYPE html>
       <label class="cfg-label" data-i18n="cfg_ampel_yellow">🟡 Gelb ab (kWh) — Budget knapp</label>
       <input type="number" id="cfg-ampel-gelb" class="cfg-input" min="-10" max="5" step="0.1">
       <div style="font-size:0.72rem; color:var(--muted); margin-top:0.25rem;" data-i18n="ampel_yellow_hint">Budget ≥ dieser Wert → gelb, darunter → 🔴 rot</div>
+    </div>
+  </div>
+
+  <!-- Growatt Direkt-Steuerung -->
+  <div class="card">
+    <div class="card-title" data-i18n="card_growatt_ctrl">⚡ Batterie-Regelung (Growatt Modbus)</div>
+    <div style="margin-bottom:0.85rem;">
+      <div style="display:flex; align-items:center; gap:0.75rem;">
+        <label class="toggle-switch">
+          <input type="checkbox" id="cfg-growatt-aktiv" onchange="onGrowattAktivChange()">
+          <span class="toggle-slider"></span>
+        </label>
+        <span class="cfg-label" style="margin:0;" data-i18n="cfg_growatt_aktiv">Growatt Modbus-Steuerung aktiv</span>
+      </div>
+      <div style="font-size:0.72rem; color:var(--muted); margin-top:0.35rem;" data-i18n="cfg_growatt_aktiv_hint">
+        Begrenzt die Batterie-Ladeleistung wenn das Auto lädt — Batterie und Auto laden gleichzeitig mit PV.
+        Nur für Growatt-Hybrid-Wechselrichter mit direktem Modbus-Zugang.
+      </div>
+    </div>
+    <div id="growatt-settings" style="display:none;">
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:0.75rem; margin-bottom:0.85rem;">
+        <div>
+          <label class="cfg-label" data-i18n="cfg_growatt_host">Modbus Host (IP)</label>
+          <input type="text" id="cfg-growatt-host" class="cfg-input" placeholder="192.168.0.47">
+        </div>
+        <div>
+          <label class="cfg-label" data-i18n="cfg_growatt_port">Port</label>
+          <input type="number" id="cfg-growatt-port" class="cfg-input" min="1" max="65535" placeholder="21">
+        </div>
+        <div>
+          <label class="cfg-label" data-i18n="cfg_growatt_slave">Slave ID</label>
+          <input type="number" id="cfg-growatt-slave" class="cfg-input" min="1" max="255" placeholder="1">
+        </div>
+      </div>
+      <div>
+        <div style="display:flex; justify-content:space-between; align-items:baseline;">
+          <label class="cfg-label" style="margin:0;" data-i18n="cfg_batt_anteil">🔋 Batterie-Anteil wenn Auto lädt</label>
+          <span style="font-size:1.1rem; font-weight:600; color:var(--blue,#60a5fa);"><span id="batt-anteil-val">60</span>%</span>
+        </div>
+        <input type="range" id="cfg-batt-anteil" min="0" max="100" step="5" value="60"
+               oninput="document.getElementById('batt-anteil-val').textContent=this.value"
+               style="width:100%; margin-top:0.4rem; accent-color:var(--blue,#60a5fa);">
+        <div style="display:flex; justify-content:space-between; font-size:0.7rem; color:var(--muted); margin-top:0.2rem;">
+          <span data-i18n="batt_anteil_0">0% = Auto zuerst</span>
+          <span data-i18n="batt_anteil_100">100% = Batterie zuerst</span>
+        </div>
+        <div style="font-size:0.72rem; color:var(--muted); margin-top:0.35rem;" data-i18n="cfg_batt_anteil_hint">
+          Anteil der PV-Leistung der zur Batterie geht. Rest steht dem Auto zur Verfügung.
+          Empfehlung: 50–70 %. Bei 0% lädt die Batterie gar nicht wenn das Auto lädt.
+        </div>
+      </div>
     </div>
   </div>
 
@@ -3302,10 +3469,18 @@ const TRANSLATIONS = {
     card_budget_buffer:"Budget-Puffer & Ampel",
     cfg_budget_buffer:"🟠 Budget-Puffer (kWh)",
     budget_buffer_hint:"Diese kWh am Ende des Budgets werden nie zum Laden verwendet — Laden stoppt früher. Im Balken orange am rechten Ende dargestellt.",
+    cfg_haus_last_modus:"⚡ Echtzeit-Hausverbrauch",
     cfg_ampel_green:"🟢 Grün ab (kWh) — Budget sicher",
     ampel_green_hint:"Budget ≥ dieser Wert → grün",
     cfg_ampel_yellow:"🟡 Gelb ab (kWh) — Budget knapp",
     ampel_yellow_hint:"Budget ≥ dieser Wert → gelb, darunter → 🔴 rot",
+    card_growatt_ctrl:"⚡ Batterie-Regelung (Growatt Modbus)",
+    cfg_growatt_aktiv:"Growatt Modbus-Steuerung aktiv",
+    cfg_growatt_aktiv_hint:"Begrenzt die Batterie-Ladeleistung wenn das Auto lädt. Nur für Growatt mit direktem Modbus-Zugang.",
+    cfg_growatt_host:"Modbus Host (IP)", cfg_growatt_port:"Port", cfg_growatt_slave:"Slave ID",
+    cfg_batt_anteil:"🔋 Batterie-Anteil wenn Auto lädt:",
+    cfg_batt_anteil_hint:"Anteil der PV-Leistung der zur Batterie geht. Rest steht dem Auto zur Verfügung. Empfehlung: 50–70%.",
+    batt_anteil_0:"0% = Auto zuerst", batt_anteil_100:"100% = Batterie zuerst",
     card_backup:"Backup & Wiederherstellung",
     btn_export_config:"⬇ Config exportieren", btn_import_config:"⬆ Config importieren",
     backup_hint:"Export speichert alle Einstellungen inkl. Sensor-IDs. Import überschreibt die aktuelle Konfiguration.",
@@ -3433,10 +3608,18 @@ const TRANSLATIONS = {
     card_budget_buffer:"Budget Buffer & Traffic Light",
     cfg_budget_buffer:"🟠 Budget Buffer (kWh)",
     budget_buffer_hint:"These kWh at the end of the budget are never used for charging — charging stops earlier. Shown in orange at the right end of the bar.",
+    cfg_haus_last_modus:"⚡ Real-time House Load",
     cfg_ampel_green:"🟢 Green from (kWh) — Budget safe",
     ampel_green_hint:"Budget ≥ this value → green",
     cfg_ampel_yellow:"🟡 Yellow from (kWh) — Budget tight",
     ampel_yellow_hint:"Budget ≥ this value → yellow, below → 🔴 red",
+    card_growatt_ctrl:"⚡ Battery Control (Growatt Modbus)",
+    cfg_growatt_aktiv:"Growatt Modbus control active",
+    cfg_growatt_aktiv_hint:"Limits battery charge power while car is charging. Only for Growatt with direct Modbus access.",
+    cfg_growatt_host:"Modbus Host (IP)", cfg_growatt_port:"Port", cfg_growatt_slave:"Slave ID",
+    cfg_batt_anteil:"🔋 Battery share while car charges:",
+    cfg_batt_anteil_hint:"Share of PV power going to battery. Remainder is available for the car. Recommended: 50–70%.",
+    batt_anteil_0:"0% = car first", batt_anteil_100:"100% = battery first",
     card_backup:"Backup & Restore",
     btn_export_config:"⬇ Export Config", btn_import_config:"⬆ Import Config",
     backup_hint:"Export saves all settings including sensor IDs. Import overwrites the current configuration.",
@@ -4060,6 +4243,8 @@ const SENSOREN_DEF_JS = [
   {key:"pv_leistung",    label:"PV Leistung aktuell",      desc:"Aktuelle PV-Erzeugungsleistung (W)"},
   {key:"haus_last",      label:"Haus Gesamtlast heute",    desc:"Gesamter Hausverbrauch heute inkl. Auto-Laden (kWh)"},
   {key:"grid_power",     label:"Netzleistung",             desc:"Aktuelle Netzleistung (W) — negativ = Einspeisung ins Netz"},
+  {key:"haus_last_w",      label:"Haus Last aktuell (W)",      desc:"Aktueller Hausverbrauch in Watt — für Echtzeit-Ladeberechnung (z.B. sensor.growatt_total_load_power)"},
+  {key:"batt_ladeleistung", label:"Batterie Ladeleistung (W)", desc:"Aktuelle Batterieladeleistung in Watt — wird von PV-Überschuss abgezogen (z.B. sensor.growatt_battery_charge_power)"},
 ];
 
 let _sensorFieldsBuilt = false;
@@ -4071,7 +4256,8 @@ function buildSensorFields() {
     '<div class="slabel">' + s.label + '</div>' +
     '<div class="sdesc">'  + s.desc  + '</div>' +
     '<div style="display:flex; gap:0.5rem;">' +
-    '<input type="text" id="cfg-sensor-' + s.key + '" class="cfg-input mono" placeholder="sensor.entity_id">' +
+    '<input type="text" id="cfg-sensor-' + s.key + '" class="cfg-input mono" placeholder="sensor.entity_id"' +
+    (s.key === "haus_last_w" ? ' oninput="updateHausLastSwitch(document.getElementById(\'cfg-haus-last-echtzeit\').checked?\'echtzeit\':\'ema\', {sensoren:{haus_last_w:this.value}})"' : '') + '>' +
     '<button class="cfg-test-btn" onclick="openEntitySearch(\'' + s.key + '\')" title="Sensor suchen" style="flex-shrink:0;">🔍</button>' +
     '<button class="cfg-test-btn" onclick="testSensor(\'' + s.key + '\')">Test</button>' +
     '</div>' +
@@ -4080,9 +4266,34 @@ function buildSensorFields() {
   ).join("");
 }
 
+function onGrowattAktivChange() {
+  const aktiv = document.getElementById("cfg-growatt-aktiv")?.checked;
+  const panel = document.getElementById("growatt-settings");
+  if (panel) panel.style.display = aktiv ? "block" : "none";
+}
+
+function updateHausLastSwitch(modus, cfg) {
+  const sw    = document.getElementById("cfg-haus-last-echtzeit");
+  const hint  = document.getElementById("haus-last-echtzeit-hint");
+  if (!sw || !hint) return;
+  const sensor = (cfg && cfg.sensoren && cfg.sensoren.haus_last_w) || "";
+  const hasSensor = sensor.trim().length > 0;
+  sw.disabled = !hasSensor;
+  sw.checked  = hasSensor && modus === "echtzeit";
+  if (!hasSensor) {
+    hint.innerHTML = '<span style="color:var(--warn)">⚠️ Kein Sensor hinterlegt — zuerst "Haus Last aktuell (W)" unter Sensoren eintragen.</span>';
+  } else {
+    hint.textContent = sw.checked
+      ? "✅ Echtzeit: Strom = (PV − " + sensor + ") ÷ 230V"
+      : "📊 EMA: Strom = (PV − Tages-Lernwert ÷ Sonnenstunden) ÷ 230V";
+  }
+}
+
+let _lastCfg = {};
 async function loadConfig() {
   try {
     const c = await (await fetch(BASE + "/api/config")).json();
+    _lastCfg = c;
     document.getElementById("cfg-evcc-url").value  = c.evcc_url || "";
     document.getElementById("cfg-batt-kap").value  = c.batterie_kapazitaet_kwh || 9.0;
     document.getElementById("cfg-interval").value  = c.update_interval_min || 5;
@@ -4126,6 +4337,22 @@ async function loadConfig() {
     document.getElementById("cfg-budget-puffer").value = c.budget_puffer_kwh ?? 0;
     document.getElementById("cfg-ampel-gruen").value   = c.ampel_gruen_kwh   ?? 0.5;
     document.getElementById("cfg-ampel-gelb").value    = c.ampel_gelb_kwh    ?? -1.0;
+    updateHausLastSwitch(c.haus_last_modus || "ema", c);
+
+    // Growatt Steuerung
+    const growattAktivEl = document.getElementById("cfg-growatt-aktiv");
+    if (growattAktivEl) { growattAktivEl.checked = !!c.growatt_steuerung_aktiv; onGrowattAktivChange(); }
+    const growattHostEl  = document.getElementById("cfg-growatt-host");
+    const growattPortEl  = document.getElementById("cfg-growatt-port");
+    const growattSlaveEl = document.getElementById("cfg-growatt-slave");
+    const battAnteilEl   = document.getElementById("cfg-batt-anteil");
+    if (growattHostEl)  growattHostEl.value  = c.growatt_modbus_host  || "192.168.0.47";
+    if (growattPortEl)  growattPortEl.value  = c.growatt_modbus_port  || 21;
+    if (growattSlaveEl) growattSlaveEl.value = c.growatt_modbus_slave || 1;
+    if (battAnteilEl) {
+      battAnteilEl.value = c.batt_charge_anteil ?? 60;
+      document.getElementById("batt-anteil-val").textContent = battAnteilEl.value;
+    }
 
     // Prognose-Anbieter
     const provSel = document.getElementById("cfg-forecast-provider");
@@ -4469,6 +4696,7 @@ async function saveConfig() {
     budget_puffer_kwh:       parseFloat(document.getElementById("cfg-budget-puffer").value) || 0,
     ampel_gruen_kwh:         parseFloat(document.getElementById("cfg-ampel-gruen").value) ?? 0.5,
     ampel_gelb_kwh:          parseFloat(document.getElementById("cfg-ampel-gelb").value) ?? -1.0,
+    haus_last_modus:         (document.getElementById("cfg-haus-last-echtzeit") || {}).checked ? "echtzeit" : "ema",
     forecast_provider:       document.getElementById("cfg-forecast-provider").value || "forecast_solar",
     solcast_api_key:         (document.getElementById("cfg-solcast-api-key")     || {}).value?.trim() || "",
     solcast_resource_id:     (document.getElementById("cfg-solcast-resource-id") || {}).value?.trim() || "",
@@ -4481,6 +4709,11 @@ async function saveConfig() {
     notify_budget_low_kwh:   parseFloat(document.getElementById("cfg-notify-budget-kwh").value) || 0.5,
     notify_deadline_urgent:  document.getElementById("cfg-notify-deadline").checked,
     notify_laden_fertig:     document.getElementById("cfg-notify-laden-fertig").checked,
+    growatt_steuerung_aktiv: document.getElementById("cfg-growatt-aktiv")?.checked ?? false,
+    growatt_modbus_host:     (document.getElementById("cfg-growatt-host")  || {}).value?.trim() || "192.168.0.47",
+    growatt_modbus_port:     parseInt((document.getElementById("cfg-growatt-port")  || {}).value) || 21,
+    growatt_modbus_slave:    parseInt((document.getElementById("cfg-growatt-slave") || {}).value) || 1,
+    batt_charge_anteil:      parseInt((document.getElementById("cfg-batt-anteil")   || {}).value) || 60,
     sensoren,
   };
   const resultEl = document.getElementById("cfg-save-result");
@@ -4981,6 +5214,12 @@ def _worker_init():
     log.info(f"Batterie: {get_batt_kap()} kWh | Ziel-SOC: {get_batt_ziel_soc()}% | Min-SOC: {get_batt_min_soc()}%")
     log.info(f"Intervall: {get_update_interval()} min | Debug: {'AN' if is_debug_mode() else 'AUS'} | Forecast: {user_settings.get('forecast_provider','forecast_solar')}")
     log.info("=" * 55)
+    # Sicherheits-Reset: evcc beim Start auf off setzen — verhindert unkontrolliertes Laden nach Rebuild
+    try:
+        evcc_set_mode("off")
+        log.info("Startup: evcc auf 'off' gesetzt")
+    except Exception as e:
+        log.warning(f"Startup evcc-Reset fehlgeschlagen: {e}")
     t = threading.Thread(target=scheduler, daemon=True)
     t.start()
 
