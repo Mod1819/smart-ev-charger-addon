@@ -2986,7 +2986,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   <!-- WB2 Status Card — nur sichtbar wenn wb2_aktiv -->
   <div id="wb2-status-card" class="card" style="display:none; margin-bottom:1rem;">
-    <div class="card-title">⚡ Wallbox 2</div>
+    <div class="card-title">⚡ Wallbox 2 <span style="font-size:0.72rem; color:#fbbf24; font-weight:400; margin-left:0.5rem;">⚠️ Beta</span></div>
     <div style="display:flex; gap:1rem; flex-wrap:wrap; align-items:center;">
       <div>
         <div style="font-size:0.72rem; color:var(--muted); margin-bottom:0.2rem;">Status</div>
@@ -3126,6 +3126,9 @@ TEMPLATE = r"""<!DOCTYPE html>
     <!-- Wallbox 2 (optional) -->
     <div class="card">
       <div class="card-title">⚡ Wallbox 2 <span style="font-size:0.75rem; color:var(--muted); font-weight:400;">(optional)</span></div>
+      <div style="background:rgba(251,191,36,0.12); border:1px solid rgba(251,191,36,0.4); border-radius:8px; padding:0.5rem 0.75rem; margin-bottom:0.85rem; font-size:0.75rem; color:#fbbf24;">
+        ⚠️ <strong>Beta-Funktion</strong> — Die Dual-Wallbox-Steuerung befindet sich noch in der Testphase. Bitte Verhalten im Betrieb beobachten.
+      </div>
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.85rem;">
         <label class="cfg-label" style="margin:0;">Zweite Wallbox aktivieren</label>
         <label class="toggle-switch">
