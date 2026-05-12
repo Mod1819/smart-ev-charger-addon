@@ -134,17 +134,27 @@ WOCHENTAGE    = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Sam
 
 def load_settings():
     data = {}
-    if SETTINGS_PATH.exists():
-        with open(SETTINGS_PATH) as f:
-            data = json.load(f)
+    for _path in (SETTINGS_PATH, SETTINGS_PATH.with_suffix(".bak")):
+        try:
+            if _path.exists():
+                _loaded = json.loads(_path.read_text(encoding="utf-8"))
+                if isinstance(_loaded, dict):
+                    if _path.suffix == ".bak":
+                        log.warning("user_settings.json korrumpit — Backup geladen")
+                    data = _loaded
+                    break
+        except Exception:
+            pass
 
     # Lernwerte
     data.setdefault("addon_aktiv", True)
     data.setdefault("min_strom_a", 6)
     data.setdefault("haus_verbrauch_kwh", 10.0)  # Startwert für EMA (vom Nutzer einzustellen)
-    data.setdefault("sensor_auto_soc",   "")     # optional: Fahrzeug-SOC Sensor
-    data.setdefault("auto_batterie_kwh", 0.0)    # optional: Fahrzeug-Batteriegröße (kWh)
-    data.setdefault("auto_ziel_soc",     80)     # Ziel-SOC Fahrzeug (%)
+    data.setdefault("sensor_auto_soc",     "")     # optional: Fahrzeug-SOC Sensor (WB1)
+    data.setdefault("auto_batterie_kwh",  0.0)    # optional: Fahrzeug-Batteriegröße (kWh)
+    data.setdefault("auto_ziel_soc",      80)     # Ziel-SOC Fahrzeug (%)
+    data.setdefault("sensor_auto_soc_wb2", "")   # optional: Fahrzeug 2 SOC Sensor (WB2)
+    data.setdefault("auto_ziel_soc_wb2",   80)   # Ziel-SOC Fahrzeug 2 (%)
     if "haus_ema_wochentag" not in data:
         base = float(data.get("haus_verbrauch_kwh", 10.0))
         data["haus_ema_wochentag"] = {str(i): base for i in range(7)}
@@ -231,8 +241,14 @@ def load_settings():
 
 
 def save_settings(s: dict):
-    with open(SETTINGS_PATH, "w") as f:
-        json.dump(s, f, indent=2)
+    tmp = SETTINGS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s, indent=2), encoding="utf-8")
+    tmp.replace(SETTINGS_PATH)
+    bak = SETTINGS_PATH.with_suffix(".bak")
+    try:
+        bak.write_text(json.dumps(s, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # Getter-Funktionen — lesen immer live aus user_settings
@@ -372,7 +388,9 @@ def _load_daily_budget():
 
 def _save_daily_budget(d):
     try:
-        BUDGET_ACC_PATH.write_text(json.dumps(d))
+        tmp = BUDGET_ACC_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d), encoding="utf-8")
+        tmp.replace(BUDGET_ACC_PATH)
     except Exception:
         pass
 
@@ -1717,6 +1735,19 @@ def control_loop():
         # Geladene Energie WB2: Live-Session genügt hier
         charged_today_wb2 = round((lp2.get("sessionEnergy") or 0) / 1000.0, 3)
 
+        # Fahrzeug 2 SOC (optional)
+        _auto_soc_wb2_entity = user_settings.get("sensor_auto_soc_wb2", "").strip()
+        _auto_ziel_soc_wb2   = int(user_settings.get("auto_ziel_soc_wb2", 80) or 80)
+        auto_soc_wb2: float | None = None
+        if _auto_soc_wb2_entity:
+            _raw2 = ha_sensor(_auto_soc_wb2_entity)
+            if _raw2 not in (None, "unavailable", "unknown"):
+                try:
+                    auto_soc_wb2 = float(_raw2)
+                except (ValueError, TypeError):
+                    auto_soc_wb2 = None
+        auto_voll_wb2 = (auto_soc_wb2 is not None) and (auto_soc_wb2 >= _auto_ziel_soc_wb2)
+
         wb2_anteil_fak = wb2_anteil / 100.0
         budget_wb2 = round(budget_verfuegbar_echt * wb2_anteil_fak, 2)
 
@@ -1760,6 +1791,14 @@ def control_loop():
                 evcc_set_maxcurrent(16, lp_id=wb2_lp_id)
                 evcc_set_mode("off", lp_id=wb2_lp_id)
 
+        elif auto_voll_wb2:
+            action_wb2 = "schlaf"
+            grund_wb2  = f"WB2 Fahrzeug voll ({auto_soc_wb2:.0f}% ≥ Ziel {_auto_ziel_soc_wb2}%)"
+            if current_mode_wb2 != "off":
+                evcc_set_mincurrent(6, lp_id=wb2_lp_id)
+                evcc_set_maxcurrent(16, lp_id=wb2_lp_id)
+                evcc_set_mode("off", lp_id=wb2_lp_id)
+
         elif budget_wb2 <= 0:
             action_wb2 = "kein_budget"
             grund_wb2  = f"WB2 Budget 0 ({wb2_anteil}% von {budget_verfuegbar_echt:.1f} kWh)"
@@ -1798,6 +1837,7 @@ def control_loop():
             "grund_wb2":             grund_wb2,
             "charged_today_wb2_kwh": charged_today_wb2,
             "budget_wb2_kwh":        budget_wb2,
+            "auto_soc_wb2":          auto_soc_wb2,
         })
         log.info(f"WB2 LP{wb2_lp_id}: Auto={'✓' if car2_connected else '✗'} | {action_wb2}")
     else:
@@ -3144,7 +3184,7 @@ TEMPLATE = r"""<!DOCTYPE html>
             <option value="3">Loadpoint 3</option>
           </select>
         </div>
-        <div>
+        <div style="margin-bottom:0.85rem;">
           <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:0.35rem;">
             <label class="cfg-label" style="margin:0;">Budget-Aufteilung WB2</label>
             <span style="font-size:1.1rem; font-weight:600; color:var(--blue,#60a5fa);">WB1 <span id="wb2-wb1-val">50</span>% / WB2 <span id="wb2-wb2-val">50</span>%</span>
@@ -3152,6 +3192,22 @@ TEMPLATE = r"""<!DOCTYPE html>
           <input type="range" id="cfg-wb2-budget-anteil" min="10" max="90" step="5" value="50"
             oninput="document.getElementById('wb2-wb2-val').textContent=this.value; document.getElementById('wb2-wb1-val').textContent=100-this.value;">
           <div style="font-size:0.72rem; color:var(--muted); margin-top:0.3rem;">Anteil des Tagesbudgets der für WB2 reserviert wird. WB1 bekommt den Rest.</div>
+        </div>
+        <div style="margin-bottom:0.65rem;">
+          <label class="cfg-label">Fahrzeug 2 SOC Sensor <span style="color:var(--muted); font-weight:400;">(optional)</span></label>
+          <div style="display:flex; gap:0.5rem;">
+            <input type="text" id="cfg-wb2-auto-soc" class="cfg-input" placeholder="sensor.auto2_soc">
+            <button class="cfg-test-btn" onclick="openEntitySearch('cfg-wb2-auto-soc')">🔍</button>
+          </div>
+          <div style="font-size:0.72rem; color:var(--muted); margin-top:0.25rem;">Wenn der SOC bekannt ist, stoppt WB2 automatisch beim Ziel.</div>
+        </div>
+        <div>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.35rem;">
+            <label class="cfg-label" style="margin:0">Ziel-SOC Fahrzeug 2</label>
+            <span id="cfg-wb2-ziel-soc-val" style="font-family:'JetBrains Mono',monospace; color:var(--accent); font-weight:700;">80%</span>
+          </div>
+          <input type="range" id="cfg-wb2-ziel-soc" min="20" max="100" step="5" value="80"
+            oninput="document.getElementById('cfg-wb2-ziel-soc-val').textContent=this.value+'%'">
         </div>
       </div>
     </div>
@@ -4574,13 +4630,14 @@ async function loadConfig() {
     document.getElementById("cfg-min-soc").value          = ms;
     document.getElementById("cfg-min-soc-val").textContent = ms + "%";
 
-    // Loadpoint-Dropdown
+    // Loadpoint-Dropdown: Platzhalter setzen (wird von loadEvccLoadpoints() ersetzt)
     const lpId = c.loadpoint_id || 1;
     const sel  = document.getElementById("cfg-loadpoint-id");
     if (![...sel.options].find(o => parseInt(o.value) === lpId)) {
       sel.innerHTML = '<option value="' + lpId + '">Loadpoint ' + lpId + '</option>';
     }
     sel.value = lpId;
+    // Echte Namen werden durch loadEvccLoadpoints() am Ende von loadConfig() befüllt
 
     // Sensoren
     const sens = c.sensoren || {};
@@ -4666,17 +4723,57 @@ async function loadConfig() {
     document.getElementById("cfg-wb2-aktiv").checked = wb2Aktiv;
     document.getElementById("wb2-fields").style.display = wb2Aktiv ? "block" : "none";
     const wb2Lp = c.wb2_loadpoint_id || 2;
-    document.getElementById("cfg-wb2-loadpoint-id").value = wb2Lp;
-    const wb2Ant = c.wb2_budget_anteil ?? 50;
-    document.getElementById("cfg-wb2-budget-anteil").value = wb2Ant;
-    document.getElementById("wb2-wb2-val").textContent = wb2Ant;
-    document.getElementById("wb2-wb1-val").textContent = 100 - wb2Ant;
+    document.getElementById("cfg-wb2-budget-anteil").value = c.wb2_budget_anteil ?? 50;
+    document.getElementById("wb2-wb2-val").textContent = c.wb2_budget_anteil ?? 50;
+    document.getElementById("wb2-wb1-val").textContent = 100 - (c.wb2_budget_anteil ?? 50);
+    // Fahrzeug 2 SOC
+    const wb2SocEl = document.getElementById("cfg-wb2-auto-soc");
+    if (wb2SocEl) wb2SocEl.value = c.sensor_auto_soc_wb2 || "";
+    const wb2ZielSocEl = document.getElementById("cfg-wb2-ziel-soc");
+    if (wb2ZielSocEl) {
+      wb2ZielSocEl.value = c.auto_ziel_soc_wb2 || 80;
+      const wb2ZielVal = document.getElementById("cfg-wb2-ziel-soc-val");
+      if (wb2ZielVal) wb2ZielVal.textContent = (c.auto_ziel_soc_wb2 || 80) + "%";
+    }
+    // Loadpoint-Namen aus evcc laden (async, kein await — UI blockiert nicht)
+    loadEvccLoadpoints(c.evcc_url, c.loadpoint_id || 1, wb2Lp);
   } catch(e) { console.error("loadConfig:", e); }
 }
 
 function toggleWb2() {
   const aktiv = document.getElementById("cfg-wb2-aktiv").checked;
   document.getElementById("wb2-fields").style.display = aktiv ? "block" : "none";
+}
+
+async function loadEvccLoadpoints(url, selectedLp1, selectedLp2) {
+  try {
+    const evccUrl = url || document.getElementById("cfg-evcc-url").value.trim();
+    if (!evccUrl) return;
+    const r = await fetch(BASE + "/api/test/evcc?url=" + encodeURIComponent(evccUrl));
+    const d = await r.json();
+    if (!d.ok || !d.loadpoints || d.loadpoints.length === 0) return;
+    // WB1-Dropdown befüllen
+    const sel1 = document.getElementById("cfg-loadpoint-id");
+    if (sel1) {
+      const cur1 = selectedLp1 || parseInt(sel1.value) || 1;
+      sel1.innerHTML = d.loadpoints.map(lp =>
+        '<option value="' + lp.id + '"' + (lp.id === cur1 ? ' selected' : '') + '>' +
+        lp.title + '</option>'
+      ).join("");
+    }
+    // WB2-Dropdown befüllen (nur LPs ab ID 2)
+    const sel2 = document.getElementById("cfg-wb2-loadpoint-id");
+    if (sel2) {
+      const cur2 = selectedLp2 || parseInt(sel2.value) || 2;
+      const lps2 = d.loadpoints.filter(lp => lp.id >= 2);
+      if (lps2.length > 0) {
+        sel2.innerHTML = lps2.map(lp =>
+          '<option value="' + lp.id + '"' + (lp.id === cur2 ? ' selected' : '') + '>' +
+          lp.title + '</option>'
+        ).join("");
+      }
+    }
+  } catch(e) { /* evcc nicht erreichbar — Dropdowns bleiben unverändert */ }
 }
 
 // Hinweistext + Defaults je nach gewähltem Anbieter
@@ -4965,6 +5062,8 @@ async function saveConfig() {
     sensor_auto_soc:         (document.getElementById("cfg-auto-soc")       || {}).value?.trim() || "",
     auto_batterie_kwh:       parseFloat((document.getElementById("cfg-auto-batt-kwh") || {}).value) || 0,
     auto_ziel_soc:           parseInt((document.getElementById("cfg-auto-ziel-soc")  || {}).value) || 80,
+    sensor_auto_soc_wb2:     (document.getElementById("cfg-wb2-auto-soc")   || {}).value?.trim() || "",
+    auto_ziel_soc_wb2:       parseInt((document.getElementById("cfg-wb2-ziel-soc")   || {}).value) || 80,
     budget_puffer_kwh:       parseFloat(document.getElementById("cfg-budget-puffer").value) || 0,
     ampel_gruen_kwh:         parseFloat(document.getElementById("cfg-ampel-gruen").value) ?? 0.5,
     ampel_gelb_kwh:          parseFloat(document.getElementById("cfg-ampel-gelb").value) ?? -1.0,
@@ -5286,9 +5385,11 @@ def api_config_get():
         "batterie_ziel_soc":       user_settings.get("batterie_ziel_soc", 100),
         "update_interval_min":     user_settings.get("update_interval_min", 5),
         "haus_verbrauch_kwh":      user_settings.get("haus_verbrauch_kwh", 10.0),
-        "sensor_auto_soc":         user_settings.get("sensor_auto_soc",   ""),
-        "auto_batterie_kwh":       user_settings.get("auto_batterie_kwh", 0.0),
-        "auto_ziel_soc":           user_settings.get("auto_ziel_soc",     80),
+        "sensor_auto_soc":         user_settings.get("sensor_auto_soc",      ""),
+        "auto_batterie_kwh":       user_settings.get("auto_batterie_kwh",   0.0),
+        "auto_ziel_soc":           user_settings.get("auto_ziel_soc",       80),
+        "sensor_auto_soc_wb2":     user_settings.get("sensor_auto_soc_wb2", ""),
+        "auto_ziel_soc_wb2":       user_settings.get("auto_ziel_soc_wb2",   80),
         "ampel_gruen_kwh":         user_settings.get("ampel_gruen_kwh", 0.5),
         "ampel_gelb_kwh":          user_settings.get("ampel_gelb_kwh", -1.0),
         "forecast_provider":       user_settings.get("forecast_provider", "forecast_solar"),
@@ -5379,6 +5480,8 @@ def api_config_save():
         "sensor_auto_soc":         str,
         "auto_batterie_kwh":       float,
         "auto_ziel_soc":           int,
+        "sensor_auto_soc_wb2":     str,
+        "auto_ziel_soc_wb2":       int,
         # Benachrichtigungen
         "notify_target":           str,
         "notify_budget_low_kwh":   float,
